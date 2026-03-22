@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+local.settings.json
+.venv/
+.azure/
+*.egg-info/
+dist/
+.python_packages/

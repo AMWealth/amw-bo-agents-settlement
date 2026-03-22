@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -:*)",
+      "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\(''function_app.py''\\).read\\(\\)\\); print\\(''OK - no syntax errors''\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\(''function_app.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK - no syntax errors''\\)\")",
+      "Bash(python -m pytest tests/test_parsers.py -k \"cub\" -v)"
+    ]
+  }
+}

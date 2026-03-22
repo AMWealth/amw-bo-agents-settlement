@@ -1,0 +1,7 @@
+azure-functions
+requests
+psycopg2-binary
+pandas
+openpyxl
+pdfplumber
+xlrd==2.0.1
