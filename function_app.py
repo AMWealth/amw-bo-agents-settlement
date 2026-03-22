@@ -3952,10 +3952,12 @@ def load_strict_deals_to_process(
     conn,
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
+    include_settled: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Loads internal deals (tab_deals) eligible for reconciliation comparison.
     date_from / date_to filter by trade_date (inclusive).
+    include_settled=True includes status=4 (SETTLED) deals (for Table A matching).
     """
     extra = ""
     params: list = []
@@ -4012,7 +4014,7 @@ def load_strict_deals_to_process(
             LEFT JOIN back_office.tab_status s
                 ON trades.status = s.id
             WHERE trades.reason = 0
-              AND trades.status NOT IN (4, 7)
+              AND trades.status NOT IN (7)
               AND trades.login <> 1007
               AND trades.type_deal <> 2
               AND trades.settle_type = 'external'
@@ -5322,6 +5324,108 @@ def reparse_recent_http(req: func.HttpRequest) -> func.HttpResponse:
                     finish_agent_run(conn, run_id, "FAILED", str(ex))
                 except Exception:
                     pass
+        return func.HttpResponse(
+            json.dumps({"error": str(ex)}),
+            mimetype="application/json", status_code=500,
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+# =============================================================================
+# HTTP TRIGGER: run_reconciliation
+# POST /api/run-reconciliation
+# =============================================================================
+@app.function_name(name="run_reconciliation")
+@app.route(route="run-reconciliation", auth_level=func.AuthLevel.FUNCTION, methods=["POST"])
+def run_reconciliation_http(req: func.HttpRequest) -> func.HttpResponse:
+    conn = None
+    run_id = None
+    try:
+        conn = get_conn()
+        run_id = start_agent_run(conn, "run_reconciliation_http")
+        t0_date, _t1_date, _t_next_date = get_t0_t1_dates()
+        confo_from = n_prev_business_days(t0_date, 2)
+        deal_from  = n_prev_business_days(t0_date, 5)
+        result = run_settlement_reconciliation(
+            conn, run_id=run_id,
+            date_from=confo_from, date_to=t0_date,
+            deal_date_from=deal_from, deal_date_to=t0_date,
+        )
+        finish_agent_run(conn, run_id, "SUCCESS",
+            f"comparison_rows={result['comparison_rows']}, matched={result['matched_count']}")
+        has_data = (result.get("comparison_rows", 0) > 0
+                    or len(result.get("unmatched_internal", [])) > 0)
+        if has_data:
+            token = get_graph_token()
+            send_reconciliation_email(token, result, confo_from, t0_date)
+        return func.HttpResponse(
+            json.dumps({"ok": True, "comparison_rows": result["comparison_rows"],
+                        "matched": result["matched_count"], "run_id": run_id}),
+            mimetype="application/json", status_code=200,
+        )
+    except Exception as ex:
+        logging.exception("run_reconciliation_http failed: %s", ex)
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        if conn and run_id:
+            try: finish_agent_run(conn, run_id, "FAILED", str(ex))
+            except Exception: pass
+        return func.HttpResponse(
+            json.dumps({"error": str(ex)}),
+            mimetype="application/json", status_code=500,
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+# =============================================================================
+# HTTP TRIGGER: run_email_parser
+# POST /api/run-email-parser
+# =============================================================================
+@app.function_name(name="run_email_parser")
+@app.route(route="run-email-parser", auth_level=func.AuthLevel.FUNCTION, methods=["POST"])
+def run_email_parser_http(req: func.HttpRequest) -> func.HttpResponse:
+    conn = None
+    run_id = None
+    try:
+        token = get_graph_token()
+        conn = get_conn()
+        run_id = start_agent_run(conn, "run_email_parser_http")
+        mapping_by_sender = load_mapping(conn)
+        allowed_senders = get_allowed_senders(mapping_by_sender)
+        since_dt = now_utc() - timedelta(hours=LOOKBACK_HOURS)
+        messages = list_recent_messages(token, GRAPH_MAILBOX, since_dt)
+        total = parsed_messages = parsed_trades = skipped = 0
+        for msg in messages:
+            total += 1
+            sender = (msg.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
+            if sender not in allowed_senders:
+                skipped += 1
+                continue
+            attachments = get_message_attachments(token, GRAPH_MAILBOX, msg["id"])
+            result = process_message(conn, msg, attachments, mapping_by_sender, dry_run=False)
+            if result.get("parsed"):
+                parsed_messages += 1
+                parsed_trades += result.get("trades_saved", 0)
+        finish_agent_run(conn, run_id, "SUCCESS",
+            f"total={total}, parsed={parsed_messages}, trades={parsed_trades}, skipped={skipped}")
+        return func.HttpResponse(
+            json.dumps({"ok": True, "total": total, "parsed_messages": parsed_messages,
+                        "parsed_trades": parsed_trades, "skipped": skipped, "run_id": run_id}),
+            mimetype="application/json", status_code=200,
+        )
+    except Exception as ex:
+        logging.exception("run_email_parser_http failed: %s", ex)
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        if conn and run_id:
+            try: finish_agent_run(conn, run_id, "FAILED", str(ex))
+            except Exception: pass
         return func.HttpResponse(
             json.dumps({"error": str(ex)}),
             mimetype="application/json", status_code=500,
