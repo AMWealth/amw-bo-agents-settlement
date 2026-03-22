@@ -5082,7 +5082,7 @@ def settlement_reconciliation_timer(mytimer: func.TimerRequest) -> None:
             date_to=t0_date,
             deal_date_from=deal_from,    # internal window: wide (5 biz days)
             deal_date_to=t0_date,
-            value_date_from=t0_date,     # exclude already-settled confos (value_date < today)
+            # no value_date_from: show all confos in window including already-settled
         )
 
         finish_agent_run(
