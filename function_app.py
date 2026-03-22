@@ -4759,6 +4759,18 @@ def run_settlement_reconciliation(
     )
     broad_deals = load_broad_trade_search(conn)
 
+    # Build set of (isin, side, trade_date) for ALL confos in the deal window
+    # (no value_date filter) — used to exclude already-confirmed deals from Table B
+    all_confo_trades = load_settlement_trades_for_reconciliation(
+        conn,
+        date_from=deal_date_from if deal_date_from is not None else date_from,
+        date_to=deal_date_to if deal_date_to is not None else date_to,
+    )
+    all_confo_keys = {
+        (clean_text(st.get("isin")), clean_text(st.get("side")), st.get("trade_date"))
+        for st in all_confo_trades
+    }
+
     comparison_rows = 0
     matched_count = 0
     matched_aggregated_count = 0
