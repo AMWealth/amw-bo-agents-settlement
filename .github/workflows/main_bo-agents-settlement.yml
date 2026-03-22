@@ -68,13 +68,6 @@ jobs:
           unzip release.zip
           rm release.zip
         
-      - name: Login to Azure
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_664CE4AC88E8429E8572F12338CA3DD8 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_673F7F6A0D604280A119D4A70ED84E69 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_BE32BA51CCF14AF38B00C93A9A2C93DC }}
-
       - name: 'Deploy to Azure Functions'
         uses: Azure/functions-action@v1
         id: deploy-to-function
@@ -82,4 +75,4 @@ jobs:
           app-name: 'bo-agents-settlement'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
