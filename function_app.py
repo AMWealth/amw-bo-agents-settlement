@@ -4101,7 +4101,15 @@ def load_strict_deals_to_process(
                 trades.accrued,
                 trades.external_id,
                 trades.order_id,
-                trades.time
+                trades.time,
+                (
+                    SELECT sss.ssi_name
+                    FROM back_office.tab_connect_deal_transfer cdt2
+                    JOIN back_office.tab_transfer tf2 ON cdt2.id_transfer = tf2.id
+                    JOIN back_office.tab_standard_settlement_instructions sss ON tf2.ssi_id = sss.id
+                    WHERE cdt2.id_deal = trades.id
+                    LIMIT 1
+                ) AS ssi_name
             FROM back_office.tab_deals trades
             LEFT JOIN back_office.tab_counterparty cp
                 ON trades.counterparty_id = cp.id
@@ -4149,7 +4157,15 @@ def load_broad_trade_search(conn) -> List[Dict[str, Any]]:
                 trades.order_id,
                 trades.time,
                 trades.nominal,
-                trades.accrued
+                trades.accrued,
+                (
+                    SELECT sss.ssi_name
+                    FROM back_office.tab_connect_deal_transfer cdt2
+                    JOIN back_office.tab_transfer tf2 ON cdt2.id_transfer = tf2.id
+                    JOIN back_office.tab_standard_settlement_instructions sss ON tf2.ssi_id = sss.id
+                    WHERE cdt2.id_deal = trades.id
+                    LIMIT 1
+                ) AS ssi_name
             FROM back_office.tab_deals trades
             LEFT JOIN back_office.tab_counterparty cp
                 ON trades.counterparty_id = cp.id
@@ -4504,7 +4520,6 @@ def _detail_row(
     agg_rows: Optional[List[Dict[str, Any]]] = None,
     agg_note: Optional[str] = None,
     notes: Optional[List[str]] = None,
-    ssi_lookup: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Build a flat dict for the human-readable reconciliation report."""
     internal_qty = None
@@ -4529,8 +4544,12 @@ def _detail_row(
         counterparty = agg_rows[0].get("counterparty")
 
     cpty_ssi = st.get("counterparty_reference") or ""
-    broker_key = (st.get("broker_name") or "").lower()
-    int_ssi = (ssi_lookup or {}).get(broker_key, "")
+    if td is not None:
+        int_ssi = td.get("ssi_name") or ""
+    elif agg_rows:
+        int_ssi = agg_rows[0].get("ssi_name") or ""
+    else:
+        int_ssi = ""
     ssi_note = "ssi_mismatch" if (cpty_ssi and int_ssi and cpty_ssi != int_ssi) else ""
 
     all_notes = list(notes or [])
@@ -4579,20 +4598,6 @@ def _fmt_date(v) -> str:
     if v is None:
         return ""
     return str(v)[:10]
-
-
-def load_ssi_lookup(conn) -> Dict[str, str]:
-    """Load SSI lookup from back_office_auto.tab_standard_settlement_instructions.
-    Returns dict: {broker_name_lower: ssi_value}
-    """
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT counterparty_name, ssi FROM back_office_auto.tab_standard_settlement_instructions"
-            )
-            return {(r["counterparty_name"] or "").lower(): (r["ssi"] or "") for r in cur.fetchall()}
-    except Exception:
-        return {}
 
 
 def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
@@ -4895,7 +4900,6 @@ def run_settlement_reconciliation(
     settlement_trades = load_settlement_trades_for_reconciliation(
         conn, date_from=date_from, date_to=date_to, value_date_from=value_date_from
     )
-    ssi_lookup = load_ssi_lookup(conn)
     strict_deals = load_strict_deals_to_process(
         conn,
         date_from=deal_date_from if deal_date_from is not None else date_from,
@@ -4959,7 +4963,7 @@ def run_settlement_reconciliation(
                 external_value_date=st.get("value_date"),
                 internal_value_date=td.get("settle_date_cash") or td.get("value_date_cash"),
             )
-            detail_rows.append(_detail_row(st, "MATCHED", td=td, ssi_lookup=ssi_lookup))
+            detail_rows.append(_detail_row(st, "MATCHED", td=td))
             continue
 
         rows, agg_status, agg_note = try_aggregate_match(st, strict_candidates)
@@ -4997,7 +5001,7 @@ def run_settlement_reconciliation(
                 external_value_date=st.get("value_date"),
                 internal_value_date=rows[0].get("settle_date_cash") or rows[0].get("value_date_cash"),
             )
-            detail_rows.append(_detail_row(st, agg_status, agg_rows=rows, agg_note=agg_note, ssi_lookup=ssi_lookup))
+            detail_rows.append(_detail_row(st, agg_status, agg_rows=rows, agg_note=agg_note))
             continue
 
         if td is not None:
@@ -5039,7 +5043,7 @@ def run_settlement_reconciliation(
                 external_value_date=st.get("value_date"),
                 internal_value_date=td.get("settle_date_cash") or td.get("value_date_cash"),
             )
-            detail_rows.append(_detail_row(st, "PARTIAL", td=td, notes=best_notes, ssi_lookup=ssi_lookup))
+            detail_rows.append(_detail_row(st, "PARTIAL", td=td, notes=best_notes))
             continue
 
         similar_rows = find_similar_broad_rows(st, broad_deals)
@@ -5078,7 +5082,7 @@ def run_settlement_reconciliation(
                         external_value_date=st.get("value_date"),
                         internal_value_date=broad_td.get("settle_date_cash") or broad_td.get("value_date_cash"),
                     )
-                    detail_rows.append(_detail_row(st, "MATCHED", td=broad_td, ssi_lookup=ssi_lookup))
+                    detail_rows.append(_detail_row(st, "MATCHED", td=broad_td))
                 else:
                     # Score < 90 — show as PARTIAL with internal data
                     partial_count += 1
@@ -5117,7 +5121,7 @@ def run_settlement_reconciliation(
                         external_value_date=st.get("value_date"),
                         internal_value_date=broad_td.get("settle_date_cash") or broad_td.get("value_date_cash"),
                     )
-                    detail_rows.append(_detail_row(st, "PARTIAL", td=broad_td, notes=broad_notes, ssi_lookup=ssi_lookup))
+                    detail_rows.append(_detail_row(st, "PARTIAL", td=broad_td, notes=broad_notes))
                 continue
 
             similar_found_count += 1
@@ -5147,7 +5151,7 @@ def run_settlement_reconciliation(
                 external_value_date=st.get("value_date"),
                 internal_value_date=None,
             )
-            detail_rows.append(_detail_row(st, "SIMILAR_FOUND_OUTSIDE_STRICT_SCOPE", ssi_lookup=ssi_lookup))
+            detail_rows.append(_detail_row(st, "SIMILAR_FOUND_OUTSIDE_STRICT_SCOPE"))
             continue
 
         not_found_count += 1
@@ -5177,7 +5181,7 @@ def run_settlement_reconciliation(
             external_value_date=st.get("value_date"),
             internal_value_date=None,
         )
-        detail_rows.append(_detail_row(st, "NOT_FOUND", ssi_lookup=ssi_lookup))
+        detail_rows.append(_detail_row(st, "NOT_FOUND"))
 
     # Reverse check: internal deals that have no matching confo in this window.
     # Exclude deals whose confo exists (even if filtered by value_date) — already settled in prior run.
