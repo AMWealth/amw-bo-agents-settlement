@@ -3692,7 +3692,7 @@ def process_message(
 # =============================================================================
 @app.function_name(name="settlement_email_parser_timer")
 @app.schedule(schedule="0 */15 * * * *", arg_name="mytimer", run_on_startup=False, use_monitor=True)
-def settlement_email_parser_timer(mytimer: func.TimerRequest, dry_run: bool = False) -> None:
+def settlement_email_parser_timer(mytimer: func.TimerRequest) -> None:
     logging.info("### settlement_email_parser_timer started ###")
 
     run_id = None
@@ -5055,7 +5055,7 @@ def run_settlement_reconciliation(
 
 @app.function_name(name="settlement_reconciliation_timer")
 @app.schedule(schedule="0 */10 * * * *", arg_name="mytimer", run_on_startup=False, use_monitor=True)
-def settlement_reconciliation_timer(mytimer: func.TimerRequest, dry_run: bool = False) -> None:
+def settlement_reconciliation_timer(mytimer: func.TimerRequest) -> None:
     logging.warning("### settlement_reconciliation_timer started ###")
 
     run_id = None
