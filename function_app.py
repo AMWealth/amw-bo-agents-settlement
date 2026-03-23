@@ -4059,6 +4059,11 @@ def load_broad_trade_search(conn) -> List[Dict[str, Any]]:
             FROM back_office.tab_deals trades
             LEFT JOIN back_office.tab_counterparty cp
                 ON trades.counterparty_id = cp.id
+            WHERE trades.reason = 0
+              AND trades.status NOT IN (4, 7)
+              AND trades.login <> 1007
+              AND trades.type_deal <> 2
+              AND trades.settle_type = 'external'
             ORDER BY trades.trade_date DESC, trades.time DESC
             """
         )
