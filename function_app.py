@@ -4014,7 +4014,7 @@ def load_strict_deals_to_process(
             LEFT JOIN back_office.tab_status s
                 ON trades.status = s.id
             WHERE trades.reason = 0
-              AND trades.status NOT IN (7)
+              AND trades.status NOT IN (4, 7)
               AND trades.login <> 1007
               AND trades.type_deal <> 2
               AND trades.settle_type = 'external'
@@ -4761,13 +4761,9 @@ def run_settlement_reconciliation(
     )
     broad_deals = load_broad_trade_search(conn)
 
-    # Build set of (isin, side, trade_date) for ALL confos in the deal window
-    # (no value_date filter) — used to exclude already-confirmed deals from Table B
-    all_confo_trades = load_settlement_trades_for_reconciliation(
-        conn,
-        date_from=deal_date_from if deal_date_from is not None else date_from,
-        date_to=deal_date_to if deal_date_to is not None else date_to,
-    )
+    # Build set of (isin, side, trade_date) for ALL confos ever received
+    # (no date filter) — used to exclude already-confirmed deals from Table B
+    all_confo_trades = load_settlement_trades_for_reconciliation(conn)
     all_confo_keys = {
         (clean_text(st.get("isin")), clean_text(st.get("side")), st.get("trade_date"))
         for st in all_confo_trades
@@ -5076,14 +5072,13 @@ def settlement_reconciliation_timer(mytimer: func.TimerRequest) -> None:
 
         t0_date, _t1_date, _t_next_date = get_t0_t1_dates()
         confo_from = n_prev_business_days(t0_date, 10)  # confo: last 10 business days (~2 weeks)
-        deal_from  = n_prev_business_days(t0_date, 10)  # internal: last 10 business days (~2 weeks)
         result = run_settlement_reconciliation(
             conn,
             run_id=run_id,
-            date_from=confo_from,        # confo window: narrow (2 biz days)
+            date_from=confo_from,     # confo window: last 10 business days
             date_to=t0_date,
-            deal_date_from=deal_from,    # internal window: wide (5 biz days)
-            deal_date_to=t0_date,
+            deal_date_from=None,      # internal deals: no date restriction (all active)
+            deal_date_to=None,
             # no value_date_from: show all confos in window including already-settled
         )
 
