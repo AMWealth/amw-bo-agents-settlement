@@ -5541,15 +5541,23 @@ def run_email_parser_http(req: func.HttpRequest) -> func.HttpResponse:
         total = parsed_messages = parsed_trades = skipped = 0
         for msg in messages:
             total += 1
-            sender = (msg.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
+            sender = normalize_email_address(msg.get("from", {}))
             if sender not in allowed_senders:
                 skipped += 1
                 continue
-            attachments = get_message_attachments(token, GRAPH_MAILBOX, msg["id"])
-            result = process_message(conn, msg, attachments, mapping_by_sender, dry_run=False)
-            if result.get("parsed"):
+            status, count = process_message(
+                conn=conn,
+                token=token,
+                mailbox=GRAPH_MAILBOX,
+                msg=msg,
+                mapping_by_sender=mapping_by_sender,
+                processing_run_id=run_id,
+            )
+            if status in {"PARSED", "NO_TRADES_FOUND"}:
                 parsed_messages += 1
-                parsed_trades += result.get("trades_saved", 0)
+            elif status in {"SKIPPED", "ALREADY_PROCESSED"}:
+                skipped += 1
+            parsed_trades += count
         finish_agent_run(conn, run_id, "SUCCESS",
             f"total={total}, parsed={parsed_messages}, trades={parsed_trades}, skipped={skipped}")
         return func.HttpResponse(
