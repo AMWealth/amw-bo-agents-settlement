@@ -4293,14 +4293,22 @@ def exact_score(st: Dict[str, Any], td: Dict[str, Any]) -> Tuple[int, List[str]]
     else:
         notes.append("value_date_mismatch")
 
-    if st.get("quantity") is not None and td.get("qty") is not None:
-        if values_equal_decimal(st.get("quantity"), td.get("qty")):
+    # Qty: compare with nominal for bonds (StoneX/PDF send face value, tab_deals.qty is lots)
+    ext_qty = st.get("quantity") or st.get("nominal")
+    int_qty = td.get("nominal") if td.get("nominal") is not None else td.get("qty")
+    if ext_qty is not None and int_qty is not None:
+        if values_equal_decimal(ext_qty, int_qty):
             score += 30
         else:
             notes.append("quantity_mismatch")
 
-    ext_price = st.get("price") if st.get("price") is not None else st.get("price_in_percentage")
-    int_price = td.get("price") if td.get("price") is not None else td.get("price_in_percentage")
+    # Price: when external uses price_in_percentage (bond % of par), compare with internal price_in_percentage
+    if st.get("price") is None and st.get("price_in_percentage") is not None:
+        ext_price = st.get("price_in_percentage")
+        int_price = td.get("price_in_percentage")
+    else:
+        ext_price = st.get("price") or st.get("price_in_percentage")
+        int_price = td.get("price") or td.get("price_in_percentage")
     if ext_price is not None and int_price is not None:
         if values_equal_decimal(ext_price, int_price, Decimal("0.5")):
             score += 20
@@ -4530,20 +4538,24 @@ def _detail_row(
     counterparty = None
 
     if td is not None:
-        internal_qty = td.get("qty")
+        internal_qty = td.get("nominal") if td.get("nominal") is not None else td.get("qty")
         internal_amount = td.get("transaction_value")
-        internal_price = td.get("price")
+        internal_price = td.get("price_in_percentage") if td.get("price_in_percentage") is not None else td.get("price")
         internal_value_date = td.get("settle_date_cash") or td.get("value_date_cash")
         internal_ids = str(td["id"])
         counterparty = td.get("counterparty")
     elif agg_rows:
-        internal_qty = sum(float(r.get("qty") or 0) for r in agg_rows)
+        internal_qty = sum(float(r.get("nominal") or r.get("qty") or 0) for r in agg_rows)
         internal_amount = sum(float(r.get("transaction_value") or 0) for r in agg_rows)
         internal_value_date = agg_rows[0].get("settle_date_cash") or agg_rows[0].get("value_date_cash")
         internal_ids = ",".join(str(r["id"]) for r in agg_rows)
         counterparty = agg_rows[0].get("counterparty")
 
-    cpty_ssi = st.get("counterparty_reference") or ""
+    # CPTY SSI only meaningful for Instinet PDF — for other parsers counterparty_reference is a trade ref
+    if st.get("parser_template") == "INSTINET_PDF":
+        cpty_ssi = st.get("counterparty_reference") or ""
+    else:
+        cpty_ssi = ""
     if td is not None:
         int_ssi = td.get("ssi_name") or ""
     elif agg_rows:
@@ -4567,9 +4579,9 @@ def _detail_row(
         "source_file": st.get("source_file"),
         "counterparty": counterparty,
         # confo (external) fields
-        "ext_qty": st.get("quantity"),
-        "ext_price": st.get("price") or st.get("price_in_percentage"),
-        "ext_amount": st.get("consideration"),
+        "ext_qty": st.get("quantity") or st.get("nominal"),
+        "ext_price": st.get("price_in_percentage") or st.get("price"),
+        "ext_amount": st.get("net_amount") or st.get("consideration"),
         "ext_value_date": st.get("value_date"),
         # internal (tab_deals) fields
         "int_qty": internal_qty,
@@ -4590,6 +4602,15 @@ def _fmt_num(v) -> str:
         return ""
     try:
         return f"{float(v):,.0f}"
+    except Exception:
+        return str(v)
+
+
+def _fmt_price(v) -> str:
+    if v is None:
+        return ""
+    try:
+        return f"{float(v):,.6f}".rstrip("0").rstrip(".")
     except Exception:
         return str(v)
 
@@ -4640,8 +4661,8 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
             row.get("broker") or "",
             _fmt_num(row.get("ext_qty")),
             _fmt_num(row.get("int_qty")),
-            _fmt_num(row.get("ext_price")),
-            _fmt_num(row.get("int_price")),
+            _fmt_price(row.get("ext_price")),
+            _fmt_price(row.get("int_price")),
             _fmt_num(row.get("ext_amount")),
             _fmt_num(row.get("int_amount")),
             row.get("cpty_ssi") or "",
@@ -4743,11 +4764,12 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
     .mismatch { color: #C00000; font-weight: bold; }
     """
 
-    def td_pair(ext_val, int_val, is_amount=False):
+    def td_pair(ext_val, int_val, is_amount=False, is_price=False):
         """Render two cells; highlight if they differ significantly."""
-        ext_s = _fmt_num(ext_val) if ext_val is not None else "&nbsp;"
-        int_s = _fmt_num(int_val) if int_val is not None else "&nbsp;"
-        threshold = 1.0 if is_amount else 0.01
+        fmt = _fmt_price if is_price else _fmt_num
+        ext_s = fmt(ext_val) if ext_val is not None else "&nbsp;"
+        int_s = fmt(int_val) if int_val is not None else "&nbsp;"
+        threshold = 1.0 if is_amount else (0.01 if not is_price else 0.5)
         mismatch = (
             ext_val is not None and int_val is not None
             and abs(float(ext_val or 0) - float(int_val or 0)) > threshold
@@ -4799,7 +4821,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         html += f"<td>{_fmt_date(row.get('value_date'))}</td>"
         html += f"<td>{row.get('broker') or ''}</td>"
         html += td_pair(row.get("ext_qty"), row.get("int_qty"))
-        html += td_pair(row.get("ext_price"), row.get("int_price"))
+        html += td_pair(row.get("ext_price"), row.get("int_price"), is_price=True)
         html += td_pair(row.get("ext_amount"), row.get("int_amount"), is_amount=True)
         html += f"<td{ssi_cls}>{ssi_display}</td>"
         html += f"<td>{row.get('notes') or ''}</td>"
