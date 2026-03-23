@@ -4582,13 +4582,13 @@ def _fmt_date(v) -> str:
 
 
 def load_ssi_lookup(conn) -> Dict[str, str]:
-    """Load SSI lookup from back_office.tab_standard_settlement_instructions.
+    """Load SSI lookup from back_office_auto.tab_standard_settlement_instructions.
     Returns dict: {broker_name_lower: ssi_value}
     """
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT counterparty_name, ssi FROM back_office.tab_standard_settlement_instructions"
+                "SELECT counterparty_name, ssi FROM back_office_auto.tab_standard_settlement_instructions"
             )
             return {(r["counterparty_name"] or "").lower(): (r["ssi"] or "") for r in cur.fetchall()}
     except Exception:
