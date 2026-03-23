@@ -2209,6 +2209,98 @@ def parse_stonex_fixed_income_pdf(
     return [trade]
 
 
+def parse_instinet_pdf(
+    text: str,
+    internet_message_id: str,
+    source_file: str,
+    email_received_at: Optional[datetime],
+    processing_run_id: Optional[int],
+    file_id: Optional[int],
+    email_id: Optional[int],
+    broker_name: str,
+) -> List[Dict[str, Any]]:
+    # Format: Instinet settlement confirmation PDF
+    # Key fields: "Participant Account No B01824" → CPTY SSI "MS-HK-CCAS/B01824"
+    # Also: ISIN, Buy/Sell, Trade Date, Settlement Date, Quantity, Price, Net Amount
+
+    direction_phrase = rx(r"(BUY|SELL)", text, re.IGNORECASE)
+    side = normalize_side(direction_phrase, "INSTINET_PDF")
+
+    isin = rx(r"\b([A-Z]{2}[A-Z0-9]{9}[0-9])\b", text)
+    security_name = rx(r"Security\s+(?:Description|Name)\s*[:\-]?\s*(.+)", text)
+    trade_date_raw = rx(r"Trade\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4}|[A-Za-z]+\s+\d+,?\s+\d{4})", text)
+    value_date_raw = rx(r"Settlement\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4}|[A-Za-z]+\s+\d+,?\s+\d{4})", text)
+    qty_raw = rx(r"(?:Quantity|Shares)\s*[:\-]?\s*([0-9,]+)", text)
+    price_raw = rx(r"(?:Price|Trade\s+Price)\s*[:\-]?\s*([0-9,\.]+)", text)
+    net_amount_raw = rx(r"Net\s+(?:Settlement\s+)?Amount\s*[:\-]?\s*([0-9,\.]+)", text)
+    ccy = rx(r"\b(USD|EUR|GBP|HKD|AED|CHF)\b", text) or "USD"
+
+    # CPTY SSI: "Participant Account No B01824" → "MS-HK-CCAS/B01824"
+    participant_account = rx(r"Participant\s+Account\s+No\.?\s+(\w+)", text)
+    cpty_ssi = f"MS-HK-CCAS/{participant_account}" if participant_account else None
+
+    ref = (
+        rx(r"(?:Confirmation|Reference|Order)\s+(?:No\.?|Number)\s*[:\-]?\s*([A-Za-z0-9\-/]+)", text)
+        or rx(r"Ref(?:erence)?\s*[:\-]?\s*([A-Za-z0-9\-/]+)", text)
+    )
+
+    trade_date = parse_date_any(trade_date_raw, prefer_day_first=True)
+    value_date = parse_date_any(value_date_raw, prefer_day_first=True)
+    quantity = parse_decimal(qty_raw)
+    price = parse_decimal(price_raw)
+    net_amount = parse_decimal(net_amount_raw)
+
+    if not ref:
+        ref = build_generic_reference(isin, side, trade_date, value_date, quantity, price)
+
+    trade = build_trade_dict(
+        internet_message_id=internet_message_id,
+        source_file=source_file,
+        source_type="pdf",
+        broker_name=broker_name,
+        security_name=security_name,
+        isin=isin,
+        side=side,
+        trade_date=trade_date,
+        value_date=value_date,
+        quantity=quantity,
+        price=price,
+        price_currency=ccy,
+        consideration=None,
+        commission=None,
+        net_amount=net_amount,
+        settlement_terms="DVP",
+        counterparty_reference=cpty_ssi or ref,
+        nominal=quantity,
+        price_in_percentage=None,
+        accrued_interest=None,
+        settlement_currency=ccy,
+        parser_template="INSTINET_PDF",
+        raw_json=json.dumps({
+            "direction_phrase": direction_phrase,
+            "trade_date_raw": trade_date_raw,
+            "value_date_raw": value_date_raw,
+            "qty_raw": qty_raw,
+            "price_raw": price_raw,
+            "net_amount_raw": net_amount_raw,
+            "participant_account": participant_account,
+            "cpty_ssi": cpty_ssi,
+        }, default=str),
+        processing_run_id=processing_run_id,
+        file_id=file_id,
+        email_id=email_id,
+        side_original_text=direction_phrase,
+        trade_date_original_text=trade_date_raw,
+        value_date_original_text=value_date_raw,
+    )
+    trade = normalize_trade_signs(trade)
+    finalize_trade_validation(trade, email_received_at)
+
+    if not trade.get("isin") and not trade.get("security_name"):
+        return []
+    return [trade]
+
+
 def parse_bondpartners_pdf(text, internet_message_id, source_file, email_received_at, processing_run_id, file_id, email_id, broker_name):
     return parse_bond_style_pdf_common(
         text=text,
@@ -2924,6 +3016,9 @@ def parse_pdf_file(
 
     if template_code == "STONEX_DAILY_STATEMENT_PDF":
         return parse_stonex_daily_statement_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
+
+    if template_code == "INSTINET_PDF":
+        return parse_instinet_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
     return []
 
@@ -3690,9 +3785,7 @@ def process_message(
 # =============================================================================
 # TIMERS
 # =============================================================================
-@app.function_name(name="settlement_email_parser_timer")
-@app.schedule(schedule="0 */15 * * * *", arg_name="mytimer", run_on_startup=False, use_monitor=True)
-def settlement_email_parser_timer(mytimer: func.TimerRequest) -> None:
+def settlement_email_parser_timer(mytimer=None) -> None:
     logging.info("### settlement_email_parser_timer started ###")
 
     run_id = None
@@ -3938,6 +4031,7 @@ def load_settlement_trades_for_reconciliation(
                 parser_template,
                 validation_status,
                 validation_note,
+                counterparty_reference,
                 created_at
             from back_office_auto.settlement_trades
             {where}
@@ -4015,7 +4109,7 @@ def load_strict_deals_to_process(
                 ON trades.status = s.id
             WHERE trades.reason = 0
               AND trades.status NOT IN (4, 7)
-              AND trades.login <> 1007
+              AND trades.login = 1
               AND trades.type_deal <> 2
               AND trades.settle_type = 'external'
               {extra}
@@ -4189,14 +4283,17 @@ def exact_score(st: Dict[str, Any], td: Dict[str, Any]) -> Tuple[int, List[str]]
         else:
             notes.append("quantity_mismatch")
 
-    if st.get("price") is not None and td.get("price") is not None:
-        if values_equal_decimal(st.get("price"), td.get("price"), Decimal("0.5")):
+    ext_price = st.get("price") if st.get("price") is not None else st.get("price_in_percentage")
+    int_price = td.get("price") if td.get("price") is not None else td.get("price_in_percentage")
+    if ext_price is not None and int_price is not None:
+        if values_equal_decimal(ext_price, int_price, Decimal("0.5")):
             score += 20
         else:
             notes.append("price_mismatch")
 
-    if st.get("consideration") is not None and td.get("transaction_value") is not None:
-        if values_equal_decimal(st.get("consideration"), td.get("transaction_value"), Decimal("0.50")):
+    ext_amount = st.get("net_amount") if st.get("net_amount") is not None else st.get("consideration")
+    if ext_amount is not None and td.get("transaction_value") is not None:
+        if values_equal_decimal(ext_amount, td.get("transaction_value"), Decimal("1.0")):
             score += 20
         else:
             notes.append("amount_mismatch")
@@ -4407,6 +4504,7 @@ def _detail_row(
     agg_rows: Optional[List[Dict[str, Any]]] = None,
     agg_note: Optional[str] = None,
     notes: Optional[List[str]] = None,
+    ssi_lookup: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Build a flat dict for the human-readable reconciliation report."""
     internal_qty = None
@@ -4430,6 +4528,15 @@ def _detail_row(
         internal_ids = ",".join(str(r["id"]) for r in agg_rows)
         counterparty = agg_rows[0].get("counterparty")
 
+    cpty_ssi = st.get("counterparty_reference") or ""
+    broker_key = (st.get("broker_name") or "").lower()
+    int_ssi = (ssi_lookup or {}).get(broker_key, "")
+    ssi_note = "ssi_mismatch" if (cpty_ssi and int_ssi and cpty_ssi != int_ssi) else ""
+
+    all_notes = list(notes or [])
+    if ssi_note:
+        all_notes.append(ssi_note)
+
     return {
         "status": status,
         "isin": st.get("isin"),
@@ -4451,8 +4558,11 @@ def _detail_row(
         "int_amount": internal_amount,
         "int_value_date": internal_value_date,
         "int_ids": internal_ids,
+        # CPTY SSI
+        "cpty_ssi": cpty_ssi,
+        "int_ssi": int_ssi,
         # mismatch details
-        "notes": ", ".join(notes) if notes else (agg_note or ""),
+        "notes": ", ".join(all_notes) if all_notes else (agg_note or ""),
     }
 
 
@@ -4469,6 +4579,20 @@ def _fmt_date(v) -> str:
     if v is None:
         return ""
     return str(v)[:10]
+
+
+def load_ssi_lookup(conn) -> Dict[str, str]:
+    """Load SSI lookup from back_office.tab_standard_settlement_instructions.
+    Returns dict: {broker_name_lower: ssi_value}
+    """
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT counterparty_name, ssi FROM back_office.tab_standard_settlement_instructions"
+            )
+            return {(r["counterparty_name"] or "").lower(): (r["ssi"] or "") for r in cur.fetchall()}
+    except Exception:
+        return {}
 
 
 def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
@@ -4489,7 +4613,7 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
     ws1.title = "Confo vs Internal"
 
     hdr = ["Status", "ISIN", "Side", "Trade Date", "Value Date", "Broker",
-           "Ext Qty", "Int Qty", "Ext Price", "Int Price", "Ext Amount", "Int Amount", "Notes"]
+           "Ext Qty", "Int Qty", "Ext Price", "Int Price", "Ext Amount", "Int Amount", "CPTY SSI", "Notes"]
     ws1.append(hdr)
     for col_idx, _ in enumerate(hdr, 1):
         cell = ws1.cell(1, col_idx)
@@ -4515,6 +4639,7 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
             _fmt_num(row.get("int_price")),
             _fmt_num(row.get("ext_amount")),
             _fmt_num(row.get("int_amount")),
+            row.get("cpty_ssi") or "",
             row.get("notes") or "",
         ]
         ws1.append(data)
@@ -4531,7 +4656,7 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
 
     # ── Sheet 2: Internal without Confo ───────────────────────────────────────
     ws2 = wb.create_sheet("Internal - No Confo")
-    hdr2 = ["ISIN", "Side", "Trade Date", "Value Date", "Counterparty", "Qty", "Amount"]
+    hdr2 = ["Back ID", "ISIN", "Side", "Trade Date", "Value Date", "Counterparty", "Qty", "Amount", "GL Account"]
     ws2.append(hdr2)
     for col_idx, _ in enumerate(hdr2, 1):
         cell = ws2.cell(1, col_idx)
@@ -4542,6 +4667,7 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
     fill_red = PatternFill("solid", fgColor="FCE4D6")
     for td in result.get("unmatched_internal", []):
         data2 = [
+            td.get("id") or "",
             td.get("symbol") or "",
             td.get("direction") or "",
             _fmt_date(td.get("trade_date")),
@@ -4549,6 +4675,7 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
             td.get("counterparty") or "",
             _fmt_num(td.get("qty")),
             _fmt_num(td.get("transaction_value")),
+            compute_gl_account(td.get("symbol", "")),
         ]
         ws2.append(data2)
         for col_idx in range(1, len(data2) + 1):
@@ -4560,6 +4687,17 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def compute_gl_account(symbol: str) -> str:
+    """Return GL Account based on ISIN/symbol.
+    Currencies (2-3 uppercase letters only) → FAB-Clients-{symbol}
+    Securities (ISIN format) → FAB_EC_Clients
+    """
+    s = (symbol or "").strip()
+    if s and re.match(r'^[A-Z]{2,3}$', s):
+        return f"FAB-Clients-{s}"
+    return "FAB_EC_Clients"
 
 
 def build_reconciliation_html(result: dict, date_from, date_to) -> str:
@@ -4634,7 +4772,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
 <table>
 <tr>
   <th>Status</th><th>ISIN</th><th>Side</th><th>Trade Date</th><th>Value Date</th>
-  <th>Broker</th><th>Ext Qty</th><th>Int Qty</th><th>Ext Price</th><th>Int Price</th><th>Ext Amount</th><th>Int Amount</th><th>Notes</th>
+  <th>Broker</th><th>Ext Qty</th><th>Int Qty</th><th>Ext Price</th><th>Int Price</th><th>Ext Amount</th><th>Int Amount</th><th>CPTY SSI</th><th>Notes</th>
 </tr>
 """
     for row in result.get("detail_rows", []):
@@ -4643,6 +4781,11 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
             continue
         bg = STATUS_BG.get(status, "#FFFFFF")
         label = STATUS_LABEL.get(status, status)
+        cpty_ssi = row.get("cpty_ssi") or ""
+        int_ssi = row.get("int_ssi") or ""
+        ssi_mismatch = cpty_ssi and int_ssi and cpty_ssi != int_ssi
+        ssi_cls = ' class="mismatch"' if ssi_mismatch else ""
+        ssi_display = cpty_ssi or "&nbsp;"
         html += f'<tr style="background:{bg}">'
         html += f"<td><b>{label}</b></td>"
         html += f"<td>{row.get('isin') or ''}</td>"
@@ -4653,6 +4796,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         html += td_pair(row.get("ext_qty"), row.get("int_qty"))
         html += td_pair(row.get("ext_price"), row.get("int_price"))
         html += td_pair(row.get("ext_amount"), row.get("int_amount"), is_amount=True)
+        html += f"<td{ssi_cls}>{ssi_display}</td>"
         html += f"<td>{row.get('notes') or ''}</td>"
         html += "</tr>\n"
     html += "</table>\n"
@@ -4663,12 +4807,13 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         html += """<div class="sect">B. Internal Deals — No Confo Received</div>
 <table>
 <tr>
-  <th>ISIN</th><th>Side</th><th>Trade Date</th><th>Value Date</th>
-  <th>Counterparty</th><th>Qty</th><th>Amount</th>
+  <th>Back ID</th><th>ISIN</th><th>Side</th><th>Trade Date</th><th>Value Date</th>
+  <th>Counterparty</th><th>Qty</th><th>Amount</th><th>GL Account</th>
 </tr>
 """
         for td in unmatched:
             html += '<tr style="background:#FCE4D6">'
+            html += f"<td>{td.get('id') or ''}</td>"
             html += f"<td>{td.get('symbol') or ''}</td>"
             html += f"<td>{td.get('direction') or ''}</td>"
             html += f"<td>{_fmt_date(td.get('trade_date'))}</td>"
@@ -4676,6 +4821,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
             html += f"<td>{td.get('counterparty') or ''}</td>"
             html += f"<td>{_fmt_num(td.get('qty'))}</td>"
             html += f"<td>{_fmt_num(td.get('transaction_value'))}</td>"
+            html += f"<td>{compute_gl_account(td.get('symbol', ''))}</td>"
             html += "</tr>\n"
         html += "</table>\n"
 
@@ -4749,6 +4895,7 @@ def run_settlement_reconciliation(
     settlement_trades = load_settlement_trades_for_reconciliation(
         conn, date_from=date_from, date_to=date_to, value_date_from=value_date_from
     )
+    ssi_lookup = load_ssi_lookup(conn)
     strict_deals = load_strict_deals_to_process(
         conn,
         date_from=deal_date_from if deal_date_from is not None else date_from,
@@ -4812,7 +4959,7 @@ def run_settlement_reconciliation(
                 external_value_date=st.get("value_date"),
                 internal_value_date=td.get("settle_date_cash") or td.get("value_date_cash"),
             )
-            detail_rows.append(_detail_row(st, "MATCHED", td=td))
+            detail_rows.append(_detail_row(st, "MATCHED", td=td, ssi_lookup=ssi_lookup))
             continue
 
         rows, agg_status, agg_note = try_aggregate_match(st, strict_candidates)
@@ -4850,7 +4997,7 @@ def run_settlement_reconciliation(
                 external_value_date=st.get("value_date"),
                 internal_value_date=rows[0].get("settle_date_cash") or rows[0].get("value_date_cash"),
             )
-            detail_rows.append(_detail_row(st, agg_status, agg_rows=rows, agg_note=agg_note))
+            detail_rows.append(_detail_row(st, agg_status, agg_rows=rows, agg_note=agg_note, ssi_lookup=ssi_lookup))
             continue
 
         if td is not None:
@@ -4892,7 +5039,7 @@ def run_settlement_reconciliation(
                 external_value_date=st.get("value_date"),
                 internal_value_date=td.get("settle_date_cash") or td.get("value_date_cash"),
             )
-            detail_rows.append(_detail_row(st, "PARTIAL", td=td, notes=best_notes))
+            detail_rows.append(_detail_row(st, "PARTIAL", td=td, notes=best_notes, ssi_lookup=ssi_lookup))
             continue
 
         similar_rows = find_similar_broad_rows(st, broad_deals)
@@ -4931,7 +5078,7 @@ def run_settlement_reconciliation(
                         external_value_date=st.get("value_date"),
                         internal_value_date=broad_td.get("settle_date_cash") or broad_td.get("value_date_cash"),
                     )
-                    detail_rows.append(_detail_row(st, "MATCHED", td=broad_td))
+                    detail_rows.append(_detail_row(st, "MATCHED", td=broad_td, ssi_lookup=ssi_lookup))
                 else:
                     # Score < 90 — show as PARTIAL with internal data
                     partial_count += 1
@@ -4970,7 +5117,7 @@ def run_settlement_reconciliation(
                         external_value_date=st.get("value_date"),
                         internal_value_date=broad_td.get("settle_date_cash") or broad_td.get("value_date_cash"),
                     )
-                    detail_rows.append(_detail_row(st, "PARTIAL", td=broad_td, notes=broad_notes))
+                    detail_rows.append(_detail_row(st, "PARTIAL", td=broad_td, notes=broad_notes, ssi_lookup=ssi_lookup))
                 continue
 
             similar_found_count += 1
@@ -5000,7 +5147,7 @@ def run_settlement_reconciliation(
                 external_value_date=st.get("value_date"),
                 internal_value_date=None,
             )
-            detail_rows.append(_detail_row(st, "SIMILAR_FOUND_OUTSIDE_STRICT_SCOPE"))
+            detail_rows.append(_detail_row(st, "SIMILAR_FOUND_OUTSIDE_STRICT_SCOPE", ssi_lookup=ssi_lookup))
             continue
 
         not_found_count += 1
@@ -5030,7 +5177,7 @@ def run_settlement_reconciliation(
             external_value_date=st.get("value_date"),
             internal_value_date=None,
         )
-        detail_rows.append(_detail_row(st, "NOT_FOUND"))
+        detail_rows.append(_detail_row(st, "NOT_FOUND", ssi_lookup=ssi_lookup))
 
     # Reverse check: internal deals that have no matching confo in this window.
     # Exclude deals whose confo exists (even if filtered by value_date) — already settled in prior run.
@@ -5053,9 +5200,7 @@ def run_settlement_reconciliation(
     }
 
 
-@app.function_name(name="settlement_reconciliation_timer")
-@app.schedule(schedule="0 */10 * * * *", arg_name="mytimer", run_on_startup=False, use_monitor=True)
-def settlement_reconciliation_timer(mytimer: func.TimerRequest) -> None:
+def settlement_reconciliation_timer(mytimer=None) -> None:
     logging.warning("### settlement_reconciliation_timer started ###")
 
     run_id = None
