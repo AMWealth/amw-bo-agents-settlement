@@ -5075,8 +5075,8 @@ def settlement_reconciliation_timer(mytimer: func.TimerRequest) -> None:
         run_id = start_agent_run(conn, "settlement_reconciliation_timer")
 
         t0_date, _t1_date, _t_next_date = get_t0_t1_dates()
-        confo_from = n_prev_business_days(t0_date, 2)   # confo: last 2 business days
-        deal_from  = n_prev_business_days(t0_date, 5)   # internal: last 5 business days
+        confo_from = n_prev_business_days(t0_date, 10)  # confo: last 10 business days (~2 weeks)
+        deal_from  = n_prev_business_days(t0_date, 10)  # internal: last 10 business days (~2 weeks)
         result = run_settlement_reconciliation(
             conn,
             run_id=run_id,
