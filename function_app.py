@@ -4566,18 +4566,9 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
     """Build HTML email body for reconciliation report."""
     matched = result.get("matched_count", 0) + result.get("matched_aggregated_count", 0)
     partial = result.get("partial_count", 0)
-    similar = result.get("similar_found_count", 0)
-    not_found = result.get("not_found_count", 0)
     no_confo = len(result.get("unmatched_internal", []))
-    review_count = partial + similar + not_found + no_confo
 
-    date_label = ""
-    if date_from and date_to:
-        date_label = f"{date_from} – {date_to}" if date_from != date_to else str(date_from)
-    elif date_from or date_to:
-        date_label = str(date_from or date_to)
-    else:
-        date_label = "all dates"
+    date_label = str(date_to or date_from or "all dates")
 
     STATUS_BG = {
         "MATCHED":                            "#C6EFCE",
@@ -4627,15 +4618,13 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
 <div style="color:#555; margin-bottom:8px;">Trade dates: <b>{date_label}</b></div>
 <div class="summary">
   <div class="badge green">✅ Matched<br><span style="font-size:22px">{matched}</span></div>
-  <div class="badge yellow">⚠️ Needs Review<br><span style="font-size:22px">{review_count}</span></div>
-  <div class="badge red">❌ Not Found<br><span style="font-size:22px">{not_found + no_confo}</span></div>
+  <div class="badge yellow">⚠️ Needs Review<br><span style="font-size:22px">{partial}</span></div>
+  <div class="badge red">❌ No Confo<br><span style="font-size:22px">{no_confo}</span></div>
 </div>
 <div style="font-size:12px; color:#555; margin-bottom:16px;">
   Exact match: {result.get('matched_count',0)} &nbsp;|&nbsp;
   Netting: {result.get('matched_aggregated_count',0)} &nbsp;|&nbsp;
   Partial (mismatch): {partial} &nbsp;|&nbsp;
-  Similar (wrong date): {similar} &nbsp;|&nbsp;
-  Not in BO: {not_found} &nbsp;|&nbsp;
   Internal no confo: {no_confo}
 </div>
 """
@@ -4699,17 +4688,14 @@ def send_reconciliation_email(token: str, result: dict, date_from, date_to) -> N
     """Send reconciliation report email with Excel attachment via Graph API."""
     matched = result.get("matched_count", 0) + result.get("matched_aggregated_count", 0)
     partial = result.get("partial_count", 0)
-    not_found = result.get("not_found_count", 0)
-    similar = result.get("similar_found_count", 0)
     no_confo = len(result.get("unmatched_internal", []))
-    review_count = partial + not_found + similar + no_confo
 
-    date_label = str(date_from or date_to or "")
+    date_label = str(date_to or date_from or "")
     subject = (
         f"Settlement Reconciliation {date_label}"
         f" | ✅ {matched} matched"
-        f" | ⚠️ {review_count} review"
-        f" | ❌ {not_found + no_confo} missing"
+        f" | ⚠️ {partial} review"
+        f" | ❌ {no_confo} missing"
     )
 
     html_body = build_reconciliation_html(result, date_from, date_to)
