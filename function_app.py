@@ -4153,7 +4153,12 @@ def load_strict_deals_to_process(
                 trades.external_id,
                 trades.order_id,
                 trades.time,
-                trades.transaction_value + COALESCE(trades.accrued, 0) + COALESCE(trades.execution_cost, 0) AS net_amount,
+                CASE
+                    WHEN trades.action = 0 THEN
+                        trades.transaction_value + COALESCE(trades.accrued, 0) - COALESCE(trades.execution_cost, 0)
+                    ELSE
+                        trades.transaction_value + COALESCE(trades.accrued, 0) + COALESCE(trades.execution_cost, 0)
+                END AS net_amount,
                 (
                     SELECT sss.ssi_name
                     FROM back_office.tab_connect_deal_transfer cdt2
@@ -4210,7 +4215,12 @@ def load_broad_trade_search(conn) -> List[Dict[str, Any]]:
                 trades.time,
                 trades.nominal,
                 trades.accrued,
-                trades.transaction_value + COALESCE(trades.accrued, 0) + COALESCE(trades.execution_cost, 0) AS net_amount,
+                CASE
+                    WHEN trades.action = 0 THEN
+                        trades.transaction_value + COALESCE(trades.accrued, 0) - COALESCE(trades.execution_cost, 0)
+                    ELSE
+                        trades.transaction_value + COALESCE(trades.accrued, 0) + COALESCE(trades.execution_cost, 0)
+                END AS net_amount,
                 (
                     SELECT sss.ssi_name
                     FROM back_office.tab_connect_deal_transfer cdt2
@@ -4270,7 +4280,12 @@ def load_unconfirmed_deals(
                 trades.price,
                 trades.price_in_percentage,
                 trades.transaction_value,
-                trades.transaction_value + COALESCE(trades.accrued, 0) + COALESCE(trades.execution_cost, 0) AS net_amount,
+                CASE
+                    WHEN trades.action = 0 THEN
+                        trades.transaction_value + COALESCE(trades.accrued, 0) - COALESCE(trades.execution_cost, 0)
+                    ELSE
+                        trades.transaction_value + COALESCE(trades.accrued, 0) + COALESCE(trades.execution_cost, 0)
+                END AS net_amount,
                 trades.currency_pay,
                 trades.login,
                 cp.name AS counterparty,
