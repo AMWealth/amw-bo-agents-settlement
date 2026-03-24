@@ -5780,12 +5780,18 @@ def run_email_parser_http(req: func.HttpRequest) -> func.HttpResponse:
         run_id = start_agent_run(conn, "run_email_parser_http")
         mapping_by_sender = load_mapping(conn)
         allowed_senders = get_allowed_senders(mapping_by_sender)
-        since_dt = now_utc() - timedelta(hours=LOOKBACK_HOURS)
+        since_hours_param = req.params.get("since_hours")
+        lookback = int(since_hours_param) if since_hours_param and since_hours_param.isdigit() else LOOKBACK_HOURS
+        since_dt = now_utc() - timedelta(hours=lookback)
         messages = list_recent_messages(token, GRAPH_MAILBOX, since_dt)
+        logging.warning("EMAIL_PARSER: fetched %d messages from mailbox since %s", len(messages), since_dt.isoformat())
         total = parsed_messages = parsed_trades = skipped = 0
         for msg in messages:
             total += 1
             sender = normalize_email_address(msg.get("from", {}))
+            logging.warning("EMAIL_PARSER msg#%d sender=%s subject=%r received=%s allowed=%s",
+                total, sender, (msg.get("subject") or "")[:60],
+                msg.get("receivedDateTime"), is_sender_allowed(sender, allowed_senders))
             if not is_sender_allowed(sender, allowed_senders):
                 skipped += 1
                 continue
