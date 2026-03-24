@@ -30,6 +30,8 @@ CLIENT_ID = os.environ.get("CLIENT_ID", "").strip()
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "").strip()
 
 GRAPH_MAILBOX = os.environ.get("GRAPH_MAILBOX", "back.office@amwealth.ae").strip()
+_mailbox2 = os.environ.get("GRAPH_MAILBOX_2", "").strip()
+GRAPH_MAILBOXES = [m for m in [GRAPH_MAILBOX, _mailbox2] if m]
 LOOKBACK_HOURS = int(os.environ.get("SETTLEMENT_LOOKBACK_HOURS", "72"))
 PG_CONN_STRING = os.environ.get("PG_CONN_STRING", "").strip()
 
@@ -3829,35 +3831,36 @@ def settlement_email_parser_timer(mytimer=None) -> None:
         allowed_senders = get_allowed_senders(mapping_by_sender)
 
         since_dt = now_utc() - timedelta(hours=LOOKBACK_HOURS)
-        messages = list_recent_messages(token, GRAPH_MAILBOX, since_dt)
 
         total = 0
         parsed_messages = 0
         parsed_trades = 0
         skipped = 0
 
-        for msg in messages:
-            total += 1
-            sender = normalize_email_address(msg.get("from", {}))
-            if not is_sender_allowed(sender, allowed_senders):
-                skipped += 1
-                continue
+        for mailbox in GRAPH_MAILBOXES:
+            messages = list_recent_messages(token, mailbox, since_dt)
+            for msg in messages:
+                total += 1
+                sender = normalize_email_address(msg.get("from", {}))
+                if not is_sender_allowed(sender, allowed_senders):
+                    skipped += 1
+                    continue
 
-            status, count = process_message(
-                conn=conn,
-                token=token,
-                mailbox=GRAPH_MAILBOX,
-                msg=msg,
-                mapping_by_sender=mapping_by_sender,
-                processing_run_id=run_id,
-            )
+                status, count = process_message(
+                    conn=conn,
+                    token=token,
+                    mailbox=mailbox,
+                    msg=msg,
+                    mapping_by_sender=mapping_by_sender,
+                    processing_run_id=run_id,
+                )
 
-            if status in {"PARSED", "NO_TRADES_FOUND"}:
-                parsed_messages += 1
-            elif status in {"SKIPPED", "ALREADY_PROCESSED"}:
-                skipped += 1
+                if status in {"PARSED", "NO_TRADES_FOUND"}:
+                    parsed_messages += 1
+                elif status in {"SKIPPED", "ALREADY_PROCESSED"}:
+                    skipped += 1
 
-            parsed_trades += count
+                parsed_trades += count
 
         finish_agent_run(
             conn,
@@ -5783,31 +5786,29 @@ def run_email_parser_http(req: func.HttpRequest) -> func.HttpResponse:
         since_hours_param = req.params.get("since_hours")
         lookback = int(since_hours_param) if since_hours_param and since_hours_param.isdigit() else LOOKBACK_HOURS
         since_dt = now_utc() - timedelta(hours=lookback)
-        messages = list_recent_messages(token, GRAPH_MAILBOX, since_dt)
-        logging.warning("EMAIL_PARSER: fetched %d messages from mailbox since %s", len(messages), since_dt.isoformat())
         total = parsed_messages = parsed_trades = skipped = 0
-        for msg in messages:
-            total += 1
-            sender = normalize_email_address(msg.get("from", {}))
-            logging.warning("EMAIL_PARSER msg#%d sender=%s subject=%r received=%s allowed=%s",
-                total, sender, (msg.get("subject") or "")[:60],
-                msg.get("receivedDateTime"), is_sender_allowed(sender, allowed_senders))
-            if not is_sender_allowed(sender, allowed_senders):
-                skipped += 1
-                continue
-            status, count = process_message(
-                conn=conn,
-                token=token,
-                mailbox=GRAPH_MAILBOX,
-                msg=msg,
-                mapping_by_sender=mapping_by_sender,
-                processing_run_id=run_id,
-            )
-            if status in {"PARSED", "NO_TRADES_FOUND"}:
-                parsed_messages += 1
-            elif status in {"SKIPPED", "ALREADY_PROCESSED"}:
-                skipped += 1
-            parsed_trades += count
+        for mailbox in GRAPH_MAILBOXES:
+            messages = list_recent_messages(token, mailbox, since_dt)
+            logging.warning("EMAIL_PARSER: fetched %d messages from %s since %s", len(messages), mailbox, since_dt.isoformat())
+            for msg in messages:
+                total += 1
+                sender = normalize_email_address(msg.get("from", {}))
+                if not is_sender_allowed(sender, allowed_senders):
+                    skipped += 1
+                    continue
+                status, count = process_message(
+                    conn=conn,
+                    token=token,
+                    mailbox=mailbox,
+                    msg=msg,
+                    mapping_by_sender=mapping_by_sender,
+                    processing_run_id=run_id,
+                )
+                if status in {"PARSED", "NO_TRADES_FOUND"}:
+                    parsed_messages += 1
+                elif status in {"SKIPPED", "ALREADY_PROCESSED"}:
+                    skipped += 1
+                parsed_trades += count
         finish_agent_run(conn, run_id, "SUCCESS",
             f"total={total}, parsed={parsed_messages}, trades={parsed_trades}, skipped={skipped}")
         return func.HttpResponse(
