@@ -4293,9 +4293,9 @@ def exact_score(st: Dict[str, Any], td: Dict[str, Any]) -> Tuple[int, List[str]]
     else:
         notes.append("value_date_mismatch")
 
-    # Qty: compare with nominal for bonds (StoneX/PDF send face value, tab_deals.qty is lots)
+    # Qty: for bonds tab_deals.nominal = face value; for equities nominal is NULL/0 → fall back to qty
     ext_qty = st.get("quantity") or st.get("nominal")
-    int_qty = td.get("nominal") if td.get("nominal") is not None else td.get("qty")
+    int_qty = td.get("nominal") if td.get("nominal") else td.get("qty")
     if ext_qty is not None and int_qty is not None:
         if values_equal_decimal(ext_qty, int_qty):
             score += 30
@@ -4538,14 +4538,14 @@ def _detail_row(
     counterparty = None
 
     if td is not None:
-        internal_qty = td.get("nominal") if td.get("nominal") is not None else td.get("qty")
+        internal_qty = td.get("nominal") if td.get("nominal") else td.get("qty")
         internal_amount = td.get("transaction_value")
-        internal_price = td.get("price_in_percentage") if td.get("price_in_percentage") is not None else td.get("price")
+        internal_price = td.get("price_in_percentage") if td.get("price_in_percentage") else td.get("price")
         internal_value_date = td.get("settle_date_cash") or td.get("value_date_cash")
         internal_ids = str(td["id"])
         counterparty = td.get("counterparty")
     elif agg_rows:
-        internal_qty = sum(float(r.get("nominal") or r.get("qty") or 0) for r in agg_rows)
+        internal_qty = sum(float(r.get("nominal") or r.get("qty") or 0) if r.get("nominal") else float(r.get("qty") or 0) for r in agg_rows)
         internal_amount = sum(float(r.get("transaction_value") or 0) for r in agg_rows)
         internal_value_date = agg_rows[0].get("settle_date_cash") or agg_rows[0].get("value_date_cash")
         internal_ids = ",".join(str(r["id"]) for r in agg_rows)
