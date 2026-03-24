@@ -234,7 +234,7 @@ def list_recent_messages(token: str, mailbox: str, since_dt: datetime) -> List[D
     filter_str = f"receivedDateTime ge {since_iso}"
 
     url = (
-        f"{GRAPH_BASE}/users/{mailbox}/messages"
+        f"{GRAPH_BASE}/users/{mailbox}/mailFolders/Inbox/messages"
         f"?$top=100"
         f"&$select=id,internetMessageId,subject,receivedDateTime,from,hasAttachments,bodyPreview"
         f"&$orderby=receivedDateTime desc"
