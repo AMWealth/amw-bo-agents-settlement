@@ -642,11 +642,26 @@ def finalize_trade_validation(trade: Dict[str, Any], email_received_at: Optional
         trade["validation_note"] = None
 
 
+# Domain-based fallback: any sender @capitalunionbank.com → CUB_PDF
+SENDER_DOMAIN_FALLBACK: Dict[str, Dict[str, str]] = {
+    "capitalunionbank.com": {"template_code": "CUB_PDF", "broker_name": "Capital Union Bank Ltd."},
+}
+
+
+def _fallback_by_domain(sender: str) -> Optional[Dict[str, str]]:
+    """Return domain fallback dict if sender domain matches, else None."""
+    domain = sender.split("@", 1)[-1].lower() if "@" in sender else ""
+    return SENDER_DOMAIN_FALLBACK.get(domain)
+
+
 def resolve_broker_name_from_mapping(sender: str, mapping_by_sender: Dict[str, Dict[str, Any]]) -> str:
     sender_key = (sender or "").strip().lower()
     row = mapping_by_sender.get(sender_key)
 
     if not row:
+        fb = _fallback_by_domain(sender_key)
+        if fb:
+            return fb["broker_name"]
         return sender_key
 
     alias_name = clean_text(row.get("counterparty_alias"))
@@ -660,8 +675,12 @@ def resolve_broker_name_from_mapping(sender: str, mapping_by_sender: Dict[str, D
 
 
 def detect_template_from_mapping(sender: str, mapping_by_sender: Dict[str, Dict[str, Any]]) -> Optional[str]:
-    row = mapping_by_sender.get((sender or "").strip().lower())
+    sender_key = (sender or "").strip().lower()
+    row = mapping_by_sender.get(sender_key)
     if not row:
+        fb = _fallback_by_domain(sender_key)
+        if fb:
+            return fb["template_code"]
         return None
     return clean_text(row.get("template_code")) or None
 
@@ -4186,6 +4205,76 @@ def load_broad_trade_search(conn) -> List[Dict[str, Any]]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def load_unconfirmed_deals(
+    conn,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Loads deals that will never receive an automated confirmation email:
+      - FX trades (type_deal = 2)
+      - ENBD trades (counterparty name contains 'ENBD')
+    These are shown in Table C as UNCONFIRMED for manual review.
+    """
+    extra = ""
+    params: list = []
+    if date_from is not None:
+        extra += " AND trades.trade_date >= %s"
+        params.append(date_from)
+    if date_to is not None:
+        extra += " AND trades.trade_date <= %s"
+        params.append(date_to)
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT
+                trades.id,
+                trades.id AS back_id,
+                CASE
+                    WHEN trades.action = 0 THEN 'BUY'
+                    WHEN trades.action = 2 THEN 'BALANCE'
+                    WHEN trades.action = 1 THEN 'SELL'
+                END AS direction,
+                trades.symbol,
+                trades.qty,
+                trades.nominal,
+                trades.price,
+                trades.price_in_percentage,
+                trades.transaction_value,
+                trades.transaction_value + COALESCE(trades.execution_cost, 0) AS net_amount,
+                trades.currency_pay,
+                trades.login,
+                cp.name AS counterparty,
+                trades.trade_date,
+                trades.value_date_cash,
+                trades.value_date_securities,
+                trades.settle_date_cash,
+                trades.settle_date_securities,
+                trades.type_deal,
+                trades.settle_type,
+                s.description AS status
+            FROM back_office.tab_deals trades
+            LEFT JOIN back_office.tab_counterparty cp
+                ON trades.counterparty_id = cp.id
+            LEFT JOIN back_office.tab_status s
+                ON trades.status = s.id
+            WHERE trades.reason = 0
+              AND trades.status NOT IN (4, 7)
+              AND trades.login = 1
+              AND (
+                  trades.type_deal = 2
+                  OR LOWER(cp.name) LIKE '%%enbd%%'
+                  OR LOWER(cp.name) LIKE '%%emirates nbd%%'
+              )
+              {extra}
+            ORDER BY trades.trade_date DESC, trades.id DESC
+            """,
+            params or None,
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 # =============================================================================
 # T0 / T1 DATE HELPERS
 # =============================================================================
@@ -4328,7 +4417,7 @@ def exact_score(st: Dict[str, Any], td: Dict[str, Any]) -> Tuple[int, List[str]]
     ext_amount = st.get("net_amount") if st.get("net_amount") is not None else st.get("consideration")
     int_amount = td.get("net_amount") if td.get("net_amount") else td.get("transaction_value")
     if ext_amount is not None and int_amount is not None:
-        if values_equal_decimal(ext_amount, int_amount, Decimal("1.0")):
+        if values_equal_decimal(ext_amount, int_amount, Decimal("0.5")):
             score += 20
         else:
             notes.append("amount_mismatch")
@@ -4385,12 +4474,18 @@ def try_aggregate_match(
         groups.setdefault(key, []).append(td)
 
     for _, rows in groups.items():
-        summed_qty = sum([float(r.get("qty") or 0) for r in rows])
-        summed_amount = sum([float(r.get("transaction_value") or 0) for r in rows])
+        summed_qty = sum(
+            float(r.get("nominal") or r.get("qty") or 0) if r.get("nominal") else float(r.get("qty") or 0)
+            for r in rows
+        )
+        summed_amount = sum(float(r.get("net_amount") or r.get("transaction_value") or 0) for r in rows)
 
-        qty_ok = st.get("quantity") is not None and values_equal_decimal(st.get("quantity"), summed_qty)
-        amount_ok = st.get("consideration") is not None and values_equal_decimal(
-            st.get("consideration"), summed_amount, Decimal("0.01")
+        ext_qty = st.get("quantity") or st.get("nominal")
+        ext_amount = st.get("net_amount") or st.get("consideration")
+
+        qty_ok = ext_qty is not None and values_equal_decimal(ext_qty, summed_qty)
+        amount_ok = ext_amount is not None and values_equal_decimal(
+            ext_amount, summed_amount, Decimal("0.5")
         )
 
         if qty_ok and amount_ok:
@@ -4730,6 +4825,38 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
     for col_idx, _ in enumerate(hdr2, 1):
         ws2.column_dimensions[get_column_letter(col_idx)].width = 18
 
+    # ── Sheet 3: Unconfirmed (FX / ENBD) ──────────────────────────────────────
+    ws3 = wb.create_sheet("Unconfirmed FX-ENBD")
+    hdr3 = ["Back ID", "ISIN / CCY", "Type", "Side", "Trade Date", "Value Date", "Counterparty", "Qty / Nominal", "Amount"]
+    ws3.append(hdr3)
+    for col_idx, _ in enumerate(hdr3, 1):
+        cell = ws3.cell(1, col_idx)
+        cell.fill = PatternFill("solid", fgColor="17375E")
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center")
+
+    fill_blue = PatternFill("solid", fgColor="DAEEF3")
+    for td in result.get("unconfirmed_deals", []):
+        type_label = "FX" if td.get("type_deal") == 2 else "ENBD"
+        qty_val = td.get("nominal") if td.get("nominal") else td.get("qty")
+        data3 = [
+            td.get("id") or "",
+            td.get("symbol") or "",
+            type_label,
+            td.get("direction") or "",
+            _fmt_date(td.get("trade_date")),
+            _fmt_date(td.get("settle_date_cash") or td.get("value_date_cash")),
+            td.get("counterparty") or "",
+            _fmt_num(qty_val),
+            _fmt_amount(td.get("net_amount") or td.get("transaction_value")),
+        ]
+        ws3.append(data3)
+        for col_idx in range(1, len(data3) + 1):
+            ws3.cell(ws3.max_row, col_idx).fill = fill_blue
+
+    for col_idx, _ in enumerate(hdr3, 1):
+        ws3.column_dimensions[get_column_letter(col_idx)].width = 18
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -4751,6 +4878,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
     matched = result.get("matched_count", 0) + result.get("matched_aggregated_count", 0)
     partial = result.get("partial_count", 0)
     no_confo = len(result.get("unmatched_internal", []))
+    unconfirmed_count = len(result.get("unconfirmed_deals", []))
 
     date_label = str(date_to or date_from or "all dates")
 
@@ -4805,12 +4933,14 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
   <div class="badge green">✅ Matched<br><span style="font-size:22px">{matched}</span></div>
   <div class="badge yellow">⚠️ Needs Review<br><span style="font-size:22px">{partial}</span></div>
   <div class="badge red">❌ No Confo<br><span style="font-size:22px">{no_confo}</span></div>
+  <div class="badge" style="background:#DAEEF3; color:#1F497D;">🔔 Unconfirmed<br><span style="font-size:22px">{unconfirmed_count}</span></div>
 </div>
 <div style="font-size:12px; color:#555; margin-bottom:16px;">
   Exact match: {result.get('matched_count',0)} &nbsp;|&nbsp;
   Netting: {result.get('matched_aggregated_count',0)} &nbsp;|&nbsp;
   Partial (mismatch): {partial} &nbsp;|&nbsp;
-  Internal no confo: {no_confo}
+  Internal no confo: {no_confo} &nbsp;|&nbsp;
+  Unconfirmed (FX/ENBD): {unconfirmed_count}
 </div>
 """
 
@@ -4872,6 +5002,32 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
             html += "</tr>\n"
         html += "</table>\n"
 
+    # ── Table C: Unconfirmed (FX / ENBD) ──────────────────────────────────────
+    unconfirmed = result.get("unconfirmed_deals", [])
+    if unconfirmed:
+        html += """<div class="sect">C. Unconfirmed Trades (FX / ENBD — no auto-confo expected)</div>
+<table>
+<tr>
+  <th>Back ID</th><th>ISIN / CCY</th><th>Type</th><th>Side</th><th>Trade Date</th><th>Value Date</th>
+  <th>Counterparty</th><th>Qty / Nominal</th><th>Amount</th>
+</tr>
+"""
+        for td in unconfirmed:
+            type_label = "FX" if td.get("type_deal") == 2 else "ENBD"
+            qty_val = td.get("nominal") if td.get("nominal") else td.get("qty")
+            html += '<tr style="background:#DAEEF3">'
+            html += f"<td>{td.get('id') or ''}</td>"
+            html += f"<td>{td.get('symbol') or ''}</td>"
+            html += f"<td><b>{type_label}</b></td>"
+            html += f"<td>{td.get('direction') or ''}</td>"
+            html += f"<td>{_fmt_date(td.get('trade_date'))}</td>"
+            html += f"<td>{_fmt_date(td.get('settle_date_cash') or td.get('value_date_cash'))}</td>"
+            html += f"<td>{td.get('counterparty') or ''}</td>"
+            html += f"<td>{_fmt_num(qty_val)}</td>"
+            html += f"<td>{_fmt_amount(td.get('net_amount') or td.get('transaction_value'))}</td>"
+            html += "</tr>\n"
+        html += "</table>\n"
+
     html += "<div style='color:#888; font-size:11px; margin-top:20px'>Generated by AM Wealth Settlement Agent</div>"
     html += "</body></html>"
     return html
@@ -4882,6 +5038,7 @@ def send_reconciliation_email(token: str, result: dict, date_from, date_to) -> N
     matched = result.get("matched_count", 0) + result.get("matched_aggregated_count", 0)
     partial = result.get("partial_count", 0)
     no_confo = len(result.get("unmatched_internal", []))
+    unconfirmed_count = len(result.get("unconfirmed_deals", []))
 
     date_label = str(date_to or date_from or "")
     subject = (
@@ -4889,6 +5046,7 @@ def send_reconciliation_email(token: str, result: dict, date_from, date_to) -> N
         f" | ✅ {matched} matched"
         f" | ⚠️ {partial} review"
         f" | ❌ {no_confo} missing"
+        f" | 🔔 {unconfirmed_count} unconfirmed"
     )
 
     html_body = build_reconciliation_html(result, date_from, date_to)
@@ -4948,6 +5106,11 @@ def run_settlement_reconciliation(
         date_to=deal_date_to if deal_date_to is not None else date_to,
     )
     broad_deals = load_broad_trade_search(conn)
+    unconfirmed_deals = load_unconfirmed_deals(
+        conn,
+        date_from=deal_date_from if deal_date_from is not None else date_from,
+        date_to=deal_date_to if deal_date_to is not None else date_to,
+    )
 
     # Build set of (isin, side, trade_date) for ALL confos ever received
     # (no date filter) — used to exclude already-confirmed deals from Table B
@@ -5243,6 +5406,7 @@ def run_settlement_reconciliation(
         "similar_found_count": similar_found_count,
         "detail_rows": detail_rows,
         "unmatched_internal": unmatched_internal,
+        "unconfirmed_deals": unconfirmed_deals,
     }
 
 
