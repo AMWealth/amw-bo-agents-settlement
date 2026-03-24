@@ -3076,6 +3076,20 @@ def parse_single_attachment(
     file_type = infer_file_type(filename)
     mapping_by_sender = mapping_by_sender or {}
 
+    # Skip if same file content was already parsed from another mailbox (forwarded copy)
+    with conn.cursor() as _cur:
+        _cur.execute(
+            """
+            SELECT 1 FROM back_office_auto.settlement_files sf
+            WHERE sf.file_hash = %s AND sf.parse_status = 'PARSED'
+            LIMIT 1
+            """,
+            (file_hash,),
+        )
+        if _cur.fetchone() is not None:
+            logging.info("Skipping duplicate file (same hash already parsed): %s", filename)
+            return 0
+
     file_id = insert_settlement_file(
         conn=conn,
         internet_message_id=internet_message_id,
