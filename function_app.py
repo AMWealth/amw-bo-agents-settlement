@@ -4065,6 +4065,34 @@ def load_settlement_trades_for_reconciliation(
         return [dict(r) for r in cur.fetchall()]
 
 
+def aggregate_settlement_trades(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Group settlement_trades rows from the same source file with the same
+    ISIN + Side + Trade Date + Value Date and sum Qty / Net Amount.
+    This handles cases like Instinet CSV where multiple partial fills
+    for the same security arrive in one file and must be netted before
+    matching against a single internal deal.
+    """
+    groups: Dict[tuple, Dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            row.get("internet_message_id") or "",
+            (row.get("isin") or "").upper().strip(),
+            (row.get("side") or "").upper().strip(),
+            row.get("trade_date"),
+            row.get("value_date"),
+        )
+        if key not in groups:
+            groups[key] = dict(row)
+        else:
+            agg = groups[key]
+            for field in ("quantity", "net_amount", "consideration", "nominal"):
+                if row.get(field) is not None:
+                    prev = agg.get(field)
+                    agg[field] = (prev or Decimal("0")) + row[field]
+    return list(groups.values())
+
+
 def load_strict_deals_to_process(
     conn,
     date_from: Optional[date] = None,
@@ -4125,7 +4153,7 @@ def load_strict_deals_to_process(
                 trades.external_id,
                 trades.order_id,
                 trades.time,
-                trades.transaction_value + COALESCE(trades.execution_cost, 0) AS net_amount,
+                trades.transaction_value + COALESCE(trades.accrued, 0) + COALESCE(trades.execution_cost, 0) AS net_amount,
                 (
                     SELECT sss.ssi_name
                     FROM back_office.tab_connect_deal_transfer cdt2
@@ -4182,7 +4210,7 @@ def load_broad_trade_search(conn) -> List[Dict[str, Any]]:
                 trades.time,
                 trades.nominal,
                 trades.accrued,
-                trades.transaction_value + COALESCE(trades.execution_cost, 0) AS net_amount,
+                trades.transaction_value + COALESCE(trades.accrued, 0) + COALESCE(trades.execution_cost, 0) AS net_amount,
                 (
                     SELECT sss.ssi_name
                     FROM back_office.tab_connect_deal_transfer cdt2
@@ -4242,7 +4270,7 @@ def load_unconfirmed_deals(
                 trades.price,
                 trades.price_in_percentage,
                 trades.transaction_value,
-                trades.transaction_value + COALESCE(trades.execution_cost, 0) AS net_amount,
+                trades.transaction_value + COALESCE(trades.accrued, 0) + COALESCE(trades.execution_cost, 0) AS net_amount,
                 trades.currency_pay,
                 trades.login,
                 cp.name AS counterparty,
@@ -5097,8 +5125,10 @@ def run_settlement_reconciliation(
       detail_rows          – list of per-confo comparison results
       unmatched_internal   – internal deals with no matching confo in the wider window
     """
-    settlement_trades = load_settlement_trades_for_reconciliation(
-        conn, date_from=date_from, date_to=date_to, value_date_from=value_date_from
+    settlement_trades = aggregate_settlement_trades(
+        load_settlement_trades_for_reconciliation(
+            conn, date_from=date_from, date_to=date_to, value_date_from=value_date_from
+        )
     )
     strict_deals = load_strict_deals_to_process(
         conn,
@@ -5114,7 +5144,9 @@ def run_settlement_reconciliation(
 
     # Build set of (isin, side, trade_date) for ALL confos ever received
     # (no date filter) — used to exclude already-confirmed deals from Table B
-    all_confo_trades = load_settlement_trades_for_reconciliation(conn)
+    all_confo_trades = aggregate_settlement_trades(
+        load_settlement_trades_for_reconciliation(conn)
+    )
     all_confo_keys = {
         (clean_text(st.get("isin")), clean_text(st.get("side")), st.get("trade_date"))
         for st in all_confo_trades
