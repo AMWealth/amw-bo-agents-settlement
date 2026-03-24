@@ -4102,6 +4102,7 @@ def load_strict_deals_to_process(
                 trades.external_id,
                 trades.order_id,
                 trades.time,
+                trades.transaction_value + COALESCE(trades.execution_cost, 0) AS net_amount,
                 (
                     SELECT sss.ssi_name
                     FROM back_office.tab_connect_deal_transfer cdt2
@@ -4158,6 +4159,7 @@ def load_broad_trade_search(conn) -> List[Dict[str, Any]]:
                 trades.time,
                 trades.nominal,
                 trades.accrued,
+                trades.transaction_value + COALESCE(trades.execution_cost, 0) AS net_amount,
                 (
                     SELECT sss.ssi_name
                     FROM back_office.tab_connect_deal_transfer cdt2
@@ -4316,8 +4318,9 @@ def exact_score(st: Dict[str, Any], td: Dict[str, Any]) -> Tuple[int, List[str]]
             notes.append("price_mismatch")
 
     ext_amount = st.get("net_amount") if st.get("net_amount") is not None else st.get("consideration")
-    if ext_amount is not None and td.get("transaction_value") is not None:
-        if values_equal_decimal(ext_amount, td.get("transaction_value"), Decimal("1.0")):
+    int_amount = td.get("net_amount") if td.get("net_amount") else td.get("transaction_value")
+    if ext_amount is not None and int_amount is not None:
+        if values_equal_decimal(ext_amount, int_amount, Decimal("1.0")):
             score += 20
         else:
             notes.append("amount_mismatch")
@@ -4539,14 +4542,14 @@ def _detail_row(
 
     if td is not None:
         internal_qty = td.get("nominal") if td.get("nominal") else td.get("qty")
-        internal_amount = td.get("transaction_value")
+        internal_amount = td.get("net_amount") if td.get("net_amount") else td.get("transaction_value")
         internal_price = td.get("price_in_percentage") if td.get("price_in_percentage") else td.get("price")
         internal_value_date = td.get("settle_date_cash") or td.get("value_date_cash")
         internal_ids = str(td["id"])
         counterparty = td.get("counterparty")
     elif agg_rows:
         internal_qty = sum(float(r.get("nominal") or r.get("qty") or 0) if r.get("nominal") else float(r.get("qty") or 0) for r in agg_rows)
-        internal_amount = sum(float(r.get("transaction_value") or 0) for r in agg_rows)
+        internal_amount = sum(float(r.get("net_amount") or r.get("transaction_value") or 0) for r in agg_rows)
         internal_value_date = agg_rows[0].get("settle_date_cash") or agg_rows[0].get("value_date_cash")
         internal_ids = ",".join(str(r["id"]) for r in agg_rows)
         counterparty = agg_rows[0].get("counterparty")
