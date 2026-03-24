@@ -2354,6 +2354,7 @@ def parse_enbd_pdf(
     # "We confirm our Buy order" → ENBD buys from AM Wealth → AM Wealth SELL
     # "We confirm our Sell order" → ENBD sells to AM Wealth → AM Wealth BUY
     # Fields: Nominal, Price/Yield (%), Principal, Accrued Interest, Total Consideration
+    logging.warning("ENBD_PDF raw text (first 2000 chars): %s", text[:2000])
     # Reference: confirmation number at top of PDF (e.g. "143716226")
 
     isin = (
