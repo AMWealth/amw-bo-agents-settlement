@@ -2357,8 +2357,14 @@ def parse_enbd_pdf(
     # "Security Identification Number : ISIN: XS..."
     # "We confirm our Buy order" → ENBD buys from AM Wealth → AM Wealth SELL
     # "We confirm our Sell order" → ENBD sells to AM Wealth → AM Wealth BUY
-    # Fields: Nominal, Price/Yield (%), Principal, Accrued Interest, Total Consideration
-    logging.warning("ENBD_PDF raw text (first 2000 chars): %s", text[:2000])
+    # Fields:
+    #   Trade Date : 23 March 2026
+    #   Settlement Date : 25 March 2026
+    #   Nominal/Number of Shares : 400,000.00
+    #   Price/Yield : 99.4
+    #   Principal : 397,600.00
+    #   Accrued Interest : 1,500.00
+    #   Total Consideration (Settlement Amount) : 399,100.00
     # Reference: confirmation number at top of PDF (e.g. "143716226")
 
     isin = (
@@ -2384,38 +2390,32 @@ def parse_enbd_pdf(
     else:
         side = None
 
-    trade_date_raw = (
-        rx(r"Trade\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][A-Za-z]{3}[-/][0-9]{2,4})", text)
-        or rx(r"Trade\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})", text)
-    )
+    # Date format: "23 March 2026" — full month name, space-separated
+    trade_date_raw = rx(r"Trade\s+Date\s*:\s*(.+)", text)
     value_date_raw = (
-        rx(r"Settlement\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][A-Za-z]{3}[-/][0-9]{2,4})", text)
-        or rx(r"Settlement\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})", text)
-        or rx(r"Value\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][A-Za-z]{3}[-/][0-9]{2,4})", text)
+        rx(r"Settlement\s+Date\s*:\s*(.+)", text)
+        or rx(r"Value\s+Date\s*:\s*(.+)", text)
     )
 
+    # "Nominal/Number of Shares : 400,000.00" — slash in label
     nominal_raw = (
-        rx(r"Nominal\s+Amount\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
-        or rx(r"Nominal\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
-        or rx(r"Face\s+Value\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+        rx(r"Nominal[^:]*:\s*([0-9,\.]+)", text)
+        or rx(r"Face\s+Value\s*:\s*([0-9,\.]+)", text)
     )
 
-    # Price/Yield is a percentage
+    # Price/Yield is a percentage: "Price/Yield : 99.4"
     price_pct_raw = (
-        rx(r"Price\s*/\s*Yield\s*[:\-]?\s*([0-9,\.]+)\s*%?", text)
-        or rx(r"Price\s*[:\-]?\s*([0-9,\.]+)\s*%", text)
-        or rx(r"Price\s*[:\-]?\s*([0-9,\.]+)", text)
+        rx(r"Price/Yield\s*:\s*([0-9,\.]+)", text)
+        or rx(r"Price\s*:\s*([0-9,\.]+)", text)
     )
 
-    principal_raw = (
-        rx(r"Principal\s+Amount\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
-        or rx(r"Principal\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
-    )
-    accrued_raw = rx(r"Accrued\s+Interest\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+    principal_raw = rx(r"Principal\s*:\s*([0-9,\.]+)", text)
+    accrued_raw = rx(r"Accrued\s+Interest\s*:\s*([0-9,\.]+)", text)
+    # "Total Consideration (Settlement Amount) : 399,100.00" — parens in label
     total_raw = (
-        rx(r"Total\s+Consideration\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
-        or rx(r"Net\s+(?:Settlement\s+)?Amount\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
-        or rx(r"Total\s+Amount\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+        rx(r"Total\s+Consideration[^:]*:\s*([0-9,\.]+)", text)
+        or rx(r"Net\s+(?:Settlement\s+)?Amount\s*:\s*([0-9,\.]+)", text)
+        or rx(r"Total\s+Amount\s*:\s*([0-9,\.]+)", text)
     )
 
     ccy = (
