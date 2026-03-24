@@ -1635,6 +1635,10 @@ def parse_cub_pdf(
             nominal=nominal,
         )
 
+    # CUB bonds: price is always % of par — use price_in_percentage so
+    # exact_score() compares against tab_deals.price_in_percentage (not absolute price)
+    price_in_pct = price_pct or price
+
     trade = build_trade_dict(
         internet_message_id=internet_message_id,
         source_file=source_file,
@@ -1646,7 +1650,7 @@ def parse_cub_pdf(
         trade_date=trade_date,
         value_date=value_date,
         quantity=None,
-        price=price,
+        price=None,
         price_currency=ccy or "USD",
         consideration=consideration,
         commission=None,
@@ -1654,7 +1658,7 @@ def parse_cub_pdf(
         settlement_terms="DVP",
         counterparty_reference=ref,
         nominal=nominal,
-        price_in_percentage=price_pct,
+        price_in_percentage=price_in_pct,
         accrued_interest=parse_decimal(accrued),
         settlement_currency=ccy or "USD",
         parser_template="CUB_PDF",
@@ -4304,13 +4308,17 @@ def exact_score(st: Dict[str, Any], td: Dict[str, Any]) -> Tuple[int, List[str]]
         else:
             notes.append("quantity_mismatch")
 
-    # Price: when external uses price_in_percentage (bond % of par), compare with internal price_in_percentage
-    if st.get("price") is None and st.get("price_in_percentage") is not None:
+    # Price: prefer price_in_percentage (bond % of par) over absolute price.
+    # If external has price_in_percentage, compare both sides on price_in_percentage.
+    if st.get("price_in_percentage") is not None:
         ext_price = st.get("price_in_percentage")
-        int_price = td.get("price_in_percentage")
-    else:
-        ext_price = st.get("price") or st.get("price_in_percentage")
+        int_price = td.get("price_in_percentage") or td.get("price")
+    elif st.get("price") is not None:
+        ext_price = st.get("price")
         int_price = td.get("price") or td.get("price_in_percentage")
+    else:
+        ext_price = None
+        int_price = None
     if ext_price is not None and int_price is not None:
         if values_equal_decimal(ext_price, int_price, Decimal("0.5")):
             score += 20
@@ -4609,6 +4617,15 @@ def _fmt_num(v) -> str:
         return str(v)
 
 
+def _fmt_amount(v) -> str:
+    if v is None:
+        return ""
+    try:
+        return f"{float(v):,.2f}"
+    except Exception:
+        return str(v)
+
+
 def _fmt_price(v) -> str:
     if v is None:
         return ""
@@ -4666,8 +4683,8 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
             _fmt_num(row.get("int_qty")),
             _fmt_price(row.get("ext_price")),
             _fmt_price(row.get("int_price")),
-            _fmt_num(row.get("ext_amount")),
-            _fmt_num(row.get("int_amount")),
+            _fmt_amount(row.get("ext_amount")),
+            _fmt_amount(row.get("int_amount")),
             row.get("cpty_ssi") or "",
             row.get("notes") or "",
         ]
@@ -4703,7 +4720,7 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
             _fmt_date(td.get("settle_date_cash") or td.get("value_date_cash")),
             td.get("counterparty") or "",
             _fmt_num(td.get("qty")),
-            _fmt_num(td.get("transaction_value")),
+            _fmt_amount(td.get("net_amount") or td.get("transaction_value")),
             compute_gl_account(td.get("symbol", "")),
         ]
         ws2.append(data2)
@@ -4769,7 +4786,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
 
     def td_pair(ext_val, int_val, is_amount=False, is_price=False):
         """Render two cells; highlight if they differ significantly."""
-        fmt = _fmt_price if is_price else _fmt_num
+        fmt = _fmt_price if is_price else (_fmt_amount if is_amount else _fmt_num)
         ext_s = fmt(ext_val) if ext_val is not None else "&nbsp;"
         int_s = fmt(int_val) if int_val is not None else "&nbsp;"
         threshold = 1.0 if is_amount else (0.01 if not is_price else 0.5)
@@ -4850,7 +4867,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
             html += f"<td>{_fmt_date(td.get('settle_date_cash') or td.get('value_date_cash'))}</td>"
             html += f"<td>{td.get('counterparty') or ''}</td>"
             html += f"<td>{_fmt_num(td.get('qty'))}</td>"
-            html += f"<td>{_fmt_num(td.get('transaction_value'))}</td>"
+            html += f"<td>{_fmt_amount(td.get('net_amount') or td.get('transaction_value'))}</td>"
             html += f"<td>{compute_gl_account(td.get('symbol', ''))}</td>"
             html += "</tr>\n"
         html += "</table>\n"
