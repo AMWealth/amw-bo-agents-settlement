@@ -1370,12 +1370,16 @@ def parse_instinet_excel(
 # =============================================================================
 def extract_pdf_text(file_bytes: bytes) -> str:
     texts: List[str] = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            try:
-                texts.append(page.extract_text() or "")
-            except Exception:
-                continue
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                try:
+                    texts.append(page.extract_text() or "")
+                except Exception:
+                    continue
+    except Exception as e:
+        logging.warning("extract_pdf_text: could not open PDF (%s), returning empty text", e)
+        return ""
     return "\n".join(texts)
 
 
