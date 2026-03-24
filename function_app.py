@@ -69,6 +69,9 @@ ALLOWED_SENDERS_FALLBACK = {
     "amna.anwar@bankfab.com",
     "umar.malik@bankfab.com",
     "vijuraj.thandalath@bankfab.com",
+    # Emirates NBD added 2026-03-24
+    "validationstryops@emiratesnbd.com",
+    "confirmationstryops@tanfeeth.ae",
 }
 
 TEST_SENDERS_DEFAULT = [
@@ -90,6 +93,8 @@ TEST_SENDERS_DEFAULT = [
     "amna.anwar@bankfab.com",
     "umar.malik@bankfab.com",
     "vijuraj.thandalath@bankfab.com",
+    "validationstryops@emiratesnbd.com",
+    "confirmationstryops@tanfeeth.ae",
 ]
 
 # =============================================================================
@@ -650,9 +655,11 @@ def finalize_trade_validation(trade: Dict[str, Any], email_received_at: Optional
         trade["validation_note"] = None
 
 
-# Domain-based fallback: any sender @capitalunionbank.com → CUB_PDF
+# Domain-based fallback: any sender @capitalunionbank.com → CUB_PDF, etc.
 SENDER_DOMAIN_FALLBACK: Dict[str, Dict[str, str]] = {
     "capitalunionbank.com": {"template_code": "CUB_PDF", "broker_name": "Capital Union Bank Ltd."},
+    "emiratesnbd.com": {"template_code": "ENBD_PDF", "broker_name": "Emirates NBD"},
+    "tanfeeth.ae": {"template_code": "ENBD_PDF", "broker_name": "Emirates NBD"},
 }
 
 
@@ -2332,6 +2339,157 @@ def parse_instinet_pdf(
     return [trade]
 
 
+def parse_enbd_pdf(
+    text: str,
+    internet_message_id: str,
+    source_file: str,
+    email_received_at: Optional[datetime],
+    processing_run_id: Optional[int],
+    file_id: Optional[int],
+    email_id: Optional[int],
+    broker_name: str,
+) -> List[Dict[str, Any]]:
+    # Format: Emirates NBD settlement confirmation PDF
+    # "Security Identification Number : ISIN: XS..."
+    # "We confirm our Buy order" → ENBD buys from AM Wealth → AM Wealth SELL
+    # "We confirm our Sell order" → ENBD sells to AM Wealth → AM Wealth BUY
+    # Fields: Nominal, Price/Yield (%), Principal, Accrued Interest, Total Consideration
+    # Reference: confirmation number at top of PDF (e.g. "143716226")
+
+    isin = (
+        rx(r"Security\s+Identification\s+Number\s*[:\-]?\s*ISIN\s*[:\-]?\s*([A-Z]{2}[A-Z0-9]{9,12})", text)
+        or rx(r"ISIN\s*[:\-]?\s*([A-Z]{2}[A-Z0-9]{9,12})", text)
+        or rx(r"\b([A-Z]{2}[A-Z0-9]{9,12})\b", text)
+    )
+
+    # ENBD perspective: "our Buy" = they buy = AM Wealth SELLS; "our Sell" = they sell = AM Wealth BUYS
+    direction_phrase = (
+        rx(r"(We\s+confirm\s+our\s+(?:Buy|Sell)\s+order)", text, re.IGNORECASE)
+        or rx(r"\b(Buy|Sell)\b", text, re.IGNORECASE)
+    )
+    # Invert: ENBD's Buy = our Sell; ENBD's Sell = our Buy
+    if direction_phrase:
+        v = direction_phrase.upper()
+        if "BUY" in v:
+            side = "SELL"
+        elif "SELL" in v:
+            side = "BUY"
+        else:
+            side = None
+    else:
+        side = None
+
+    trade_date_raw = (
+        rx(r"Trade\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][A-Za-z]{3}[-/][0-9]{2,4})", text)
+        or rx(r"Trade\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})", text)
+    )
+    value_date_raw = (
+        rx(r"Settlement\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][A-Za-z]{3}[-/][0-9]{2,4})", text)
+        or rx(r"Settlement\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})", text)
+        or rx(r"Value\s+Date\s*[:\-]?\s*([0-9]{1,2}[-/][A-Za-z]{3}[-/][0-9]{2,4})", text)
+    )
+
+    nominal_raw = (
+        rx(r"Nominal\s+Amount\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+        or rx(r"Nominal\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+        or rx(r"Face\s+Value\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+    )
+
+    # Price/Yield is a percentage
+    price_pct_raw = (
+        rx(r"Price\s*/\s*Yield\s*[:\-]?\s*([0-9,\.]+)\s*%?", text)
+        or rx(r"Price\s*[:\-]?\s*([0-9,\.]+)\s*%", text)
+        or rx(r"Price\s*[:\-]?\s*([0-9,\.]+)", text)
+    )
+
+    principal_raw = (
+        rx(r"Principal\s+Amount\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+        or rx(r"Principal\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+    )
+    accrued_raw = rx(r"Accrued\s+Interest\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+    total_raw = (
+        rx(r"Total\s+Consideration\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+        or rx(r"Net\s+(?:Settlement\s+)?Amount\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+        or rx(r"Total\s+Amount\s*[:\-]?\s*(?:[A-Z]{3}\s*)?([0-9,\.]+)", text)
+    )
+
+    ccy = (
+        rx(r"(?:Nominal|Principal|Total)\s+(?:Amount\s+)?([A-Z]{3})\s+[0-9,\.]+", text)
+        or rx(r"\b(USD|EUR|AED|GBP|CHF|HKD)\b", text)
+    )
+
+    ref = (
+        rx(r"(?:Confirmation|Reference|Transaction)\s*(?:No\.?|Number|Ref\.?)\s*[:\-]?\s*([A-Za-z0-9\-/]+)", text)
+        or rx(r"Ref\s*[:\-]?\s*([A-Za-z0-9\-/]+)", text)
+        or rx(r"^([0-9]{6,12})\b", text, re.MULTILINE)
+    )
+
+    security_name = (
+        rx(r"Security\s+(?:Name|Description)\s*[:\-]?\s*(.+)", text)
+        or rx(r"Instrument\s*[:\-]?\s*(.+)", text)
+    )
+
+    trade_date = parse_date_any(trade_date_raw, prefer_day_first=True)
+    value_date = parse_date_any(value_date_raw, prefer_day_first=True)
+    nominal = parse_decimal(nominal_raw)
+    price_pct = parse_decimal(price_pct_raw)
+    consideration = parse_decimal(principal_raw)
+    accrued = parse_decimal(accrued_raw)
+    total = parse_decimal(total_raw)
+
+    if not ref:
+        ref = build_generic_reference(isin, side, trade_date, value_date, None, price_pct, nominal)
+
+    trade = build_trade_dict(
+        internet_message_id=internet_message_id,
+        source_file=source_file,
+        source_type="pdf",
+        broker_name=broker_name,
+        security_name=security_name,
+        isin=isin,
+        side=side,
+        trade_date=trade_date,
+        value_date=value_date,
+        quantity=None,
+        price=None,
+        price_currency=ccy or "USD",
+        consideration=consideration or total,
+        commission=None,
+        net_amount=total,
+        settlement_terms="DVP",
+        counterparty_reference=ref,
+        nominal=nominal,
+        price_in_percentage=price_pct,
+        accrued_interest=accrued,
+        settlement_currency=ccy or "USD",
+        parser_template="ENBD_PDF",
+        raw_json=json.dumps({
+            "direction_phrase": direction_phrase,
+            "trade_date_raw": trade_date_raw,
+            "value_date_raw": value_date_raw,
+            "nominal_raw": nominal_raw,
+            "price_pct_raw": price_pct_raw,
+            "principal_raw": principal_raw,
+            "accrued_raw": accrued_raw,
+            "total_raw": total_raw,
+            "currency": ccy,
+            "security_name": security_name,
+        }, default=str),
+        processing_run_id=processing_run_id,
+        file_id=file_id,
+        email_id=email_id,
+        side_original_text=direction_phrase,
+        trade_date_original_text=trade_date_raw,
+        value_date_original_text=value_date_raw,
+    )
+    trade = normalize_trade_signs(trade)
+    finalize_trade_validation(trade, email_received_at)
+
+    if not trade.get("isin") and not trade.get("security_name"):
+        return []
+    return [trade]
+
+
 def parse_bondpartners_pdf(text, internet_message_id, source_file, email_received_at, processing_run_id, file_id, email_id, broker_name):
     return parse_bond_style_pdf_common(
         text=text,
@@ -3050,6 +3208,9 @@ def parse_pdf_file(
 
     if template_code == "INSTINET_PDF":
         return parse_instinet_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
+
+    if template_code == "ENBD_PDF":
+        return parse_enbd_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
     return []
 
@@ -4264,8 +4425,8 @@ def load_unconfirmed_deals(
     """
     Loads deals that will never receive an automated confirmation email:
       - FX trades (type_deal = 2)
-      - ENBD trades (counterparty name contains 'ENBD')
     These are shown in Table C as UNCONFIRMED for manual review.
+    Note: ENBD is now handled via ENBD_PDF parser and goes through normal reconciliation (Tables A/B).
     """
     extra = ""
     params: list = []
@@ -4313,11 +4474,7 @@ def load_unconfirmed_deals(
             WHERE trades.reason = 0
               AND trades.status NOT IN (4, 7)
               AND trades.login = 1
-              AND (
-                  trades.type_deal = 2
-                  OR LOWER(cp.name) LIKE '%%enbd%%'
-                  OR LOWER(cp.name) LIKE '%%emirates nbd%%'
-              )
+              AND trades.type_deal = 2
               {extra}
             ORDER BY trades.trade_date DESC, trades.id DESC
             """,
@@ -4876,8 +5033,8 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
     for col_idx, _ in enumerate(hdr2, 1):
         ws2.column_dimensions[get_column_letter(col_idx)].width = 18
 
-    # ── Sheet 3: Unconfirmed (FX / ENBD) ──────────────────────────────────────
-    ws3 = wb.create_sheet("Unconfirmed FX-ENBD")
+    # ── Sheet 3: Unconfirmed (FX) ──────────────────────────────────────────────
+    ws3 = wb.create_sheet("Unconfirmed FX")
     hdr3 = ["Back ID", "ISIN / CCY", "Type", "Side", "Trade Date", "Value Date", "Counterparty", "Qty / Nominal", "Amount"]
     ws3.append(hdr3)
     for col_idx, _ in enumerate(hdr3, 1):
@@ -4888,7 +5045,7 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
 
     fill_blue = PatternFill("solid", fgColor="DAEEF3")
     for td in result.get("unconfirmed_deals", []):
-        type_label = "FX" if td.get("type_deal") == 2 else "ENBD"
+        type_label = "FX"
         qty_val = td.get("nominal") if td.get("nominal") else td.get("qty")
         data3 = [
             td.get("id") or "",
@@ -4991,7 +5148,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
   Netting: {result.get('matched_aggregated_count',0)} &nbsp;|&nbsp;
   Partial (mismatch): {partial} &nbsp;|&nbsp;
   Internal no confo: {no_confo} &nbsp;|&nbsp;
-  Unconfirmed (FX/ENBD): {unconfirmed_count}
+  Unconfirmed (FX): {unconfirmed_count}
 </div>
 """
 
@@ -5053,10 +5210,10 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
             html += "</tr>\n"
         html += "</table>\n"
 
-    # ── Table C: Unconfirmed (FX / ENBD) ──────────────────────────────────────
+    # ── Table C: Unconfirmed (FX) ──────────────────────────────────────────────
     unconfirmed = result.get("unconfirmed_deals", [])
     if unconfirmed:
-        html += """<div class="sect">C. Unconfirmed Trades (FX / ENBD — no auto-confo expected)</div>
+        html += """<div class="sect">C. Unconfirmed Trades (FX — no auto-confo expected)</div>
 <table>
 <tr>
   <th>Back ID</th><th>ISIN / CCY</th><th>Type</th><th>Side</th><th>Trade Date</th><th>Value Date</th>
@@ -5064,7 +5221,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
 </tr>
 """
         for td in unconfirmed:
-            type_label = "FX" if td.get("type_deal") == 2 else "ENBD"
+            type_label = "FX"
             qty_val = td.get("nominal") if td.get("nominal") else td.get("qty")
             html += '<tr style="background:#DAEEF3">'
             html += f"<td>{td.get('id') or ''}</td>"
