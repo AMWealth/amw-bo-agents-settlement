@@ -196,6 +196,12 @@ def get_allowed_senders(mapping_by_sender: Dict[str, Dict[str, Any]]) -> set:
     return allowed
 
 
+def is_sender_allowed(sender: str, allowed_senders: set) -> bool:
+    """Return True if sender is in the exact allowlist OR matches a domain fallback."""
+    key = (sender or "").strip().lower()
+    return key in allowed_senders or _fallback_by_domain(key) is not None
+
+
 # =============================================================================
 # GRAPH
 # =============================================================================
@@ -3375,7 +3381,7 @@ def process_message_for_debug(
         result["status"] = "SKIPPED_NO_INTERNET_MESSAGE_ID"
         return result
 
-    if sender not in mapping_by_sender:
+    if sender not in mapping_by_sender and _fallback_by_domain(sender) is None:
         result["status"] = "SKIPPED_NO_MAPPING"
         return result
 
@@ -3665,7 +3671,7 @@ def process_message(
     if not internet_message_id:
         return ("SKIPPED", 0)
 
-    if sender not in mapping_by_sender:
+    if sender not in mapping_by_sender and _fallback_by_domain(sender) is None:
         insert_settlement_email(
             conn=conn,
             internet_message_id=internet_message_id,
@@ -3833,7 +3839,7 @@ def settlement_email_parser_timer(mytimer=None) -> None:
         for msg in messages:
             total += 1
             sender = normalize_email_address(msg.get("from", {}))
-            if sender not in allowed_senders:
+            if not is_sender_allowed(sender, allowed_senders):
                 skipped += 1
                 continue
 
@@ -5780,7 +5786,7 @@ def run_email_parser_http(req: func.HttpRequest) -> func.HttpResponse:
         for msg in messages:
             total += 1
             sender = normalize_email_address(msg.get("from", {}))
-            if sender not in allowed_senders:
+            if not is_sender_allowed(sender, allowed_senders):
                 skipped += 1
                 continue
             status, count = process_message(
