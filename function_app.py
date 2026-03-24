@@ -4967,7 +4967,7 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
     ws1.title = "Confo vs Internal"
 
     hdr = ["Status", "ISIN", "Side", "Trade Date", "Value Date", "Broker",
-           "Ext Qty", "Int Qty", "Ext Price", "Int Price", "Ext Amount", "Int Amount", "CPTY SSI", "Notes"]
+           "Ext Qty", "Int Qty", "Ext Price", "Int Price", "Ext Amount", "Int Amount", "Δ Amount", "CPTY SSI", "Notes"]
     ws1.append(hdr)
     for col_idx, _ in enumerate(hdr, 1):
         cell = ws1.cell(1, col_idx)
@@ -4993,6 +4993,7 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
             _fmt_price(row.get("int_price")),
             _fmt_amount(row.get("ext_amount")),
             _fmt_amount(row.get("int_amount")),
+            round(float(row["ext_amount"]) - float(row["int_amount"]), 2) if row.get("ext_amount") is not None and row.get("int_amount") is not None else "",
             row.get("cpty_ssi") or "",
             row.get("notes") or "",
         ]
@@ -5162,7 +5163,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
 <table>
 <tr>
   <th>Status</th><th>ISIN</th><th>Side</th><th>Trade Date</th><th>Value Date</th>
-  <th>Broker</th><th>Ext Qty</th><th>Int Qty</th><th>Ext Price</th><th>Int Price</th><th>Ext Amount</th><th>Int Amount</th><th>CPTY SSI</th><th>Notes</th>
+  <th>Broker</th><th>Ext Qty</th><th>Int Qty</th><th>Ext Price</th><th>Int Price</th><th>Ext Amount</th><th>Int Amount</th><th>Δ Amount</th><th>CPTY SSI</th><th>Notes</th>
 </tr>
 """
     for row in result.get("detail_rows", []):
@@ -5186,6 +5187,18 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         html += td_pair(row.get("ext_qty"), row.get("int_qty"))
         html += td_pair(row.get("ext_price"), row.get("int_price"), is_price=True)
         html += td_pair(row.get("ext_amount"), row.get("int_amount"), is_amount=True)
+        _ea = row.get("ext_amount")
+        _ia = row.get("int_amount")
+        if _ea is not None and _ia is not None:
+            try:
+                _diff = float(_ea) - float(_ia)
+                _diff_str = f"{_diff:+,.2f}"
+                _diff_color = ' style="color:green"' if abs(_diff) < 1 else ' style="color:red;font-weight:bold"'
+            except Exception:
+                _diff_str, _diff_color = "", ""
+        else:
+            _diff_str, _diff_color = "", ""
+        html += f"<td{_diff_color}>{_diff_str}</td>"
         html += f"<td{ssi_cls}>{ssi_display}</td>"
         html += f"<td>{row.get('notes') or ''}</td>"
         html += "</tr>\n"
