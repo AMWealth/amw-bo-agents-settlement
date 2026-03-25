@@ -61,6 +61,7 @@ ALLOWED_SENDERS_FALLBACK = {
     "donotreplysecuritiesconfirmations@stonex.com",
     "bplmailer@bpl-bondpartners.ch",
     "emccarthy@seaportglobal.com",
+    "eohara@seaportglobal.com",
     "settlement@bridport.ch",
     "opsseclendingrepo@stonex.com",
     "statements@stonex.com",
@@ -87,6 +88,7 @@ TEST_SENDERS_DEFAULT = [
     "bplmailer@bpl-bondpartners.ch",
     "statements@stonex.com",
     "emccarthy@seaportglobal.com",
+    "eohara@seaportglobal.com",
     "settlement@bridport.ch",
     "opsseclendingrepo@stonex.com",
     "grant.westover@stonex.com",
@@ -534,6 +536,12 @@ def normalize_side(value: Optional[str], template_code: Optional[str] = None) ->
         return "BUY"
 
     if v in {"S", "SELL", "SLD", "SOLD"}:
+        return "SELL"
+
+    # Bondpartners: "Your purchase" = AM Wealth buys, "Your sale" = AM Wealth sells
+    if "YOUR PURCHASE" in v:
+        return "BUY"
+    if "YOUR SALE" in v:
         return "SELL"
 
     if "WE SOLD TO YOU" in v:
@@ -2496,17 +2504,117 @@ def parse_enbd_pdf(
 
 
 def parse_bondpartners_pdf(text, internet_message_id, source_file, email_received_at, processing_run_id, file_id, email_id, broker_name):
-    return parse_bond_style_pdf_common(
-        text=text,
+    logging.warning("BONDPARTNERS_PDF RAW TEXT START >>>\n%s\n<<< BONDPARTNERS_PDF RAW TEXT END", text)
+    # Format: Bondpartners SA contract note
+    # Direction: "Transaction type  Your purchase  Our sale"
+    # Trade date: "Trade date  Mar. 25, 2026 11:53 CET"
+    # Value date embedded in: "Net consideration  To your debit  Value date Mar. 26, 2026  USD 269'732.50"
+    # Nominal: "Nominal amount  240'000.00" (Swiss apostrophe thousands separator)
+    # Price: "Trade price  110.600000  pct"
+    # Accrued: "Accrued interests  101 days  USD  4'292.50"
+    # Total: "Total amount  USD  269'732.50"
+
+    direction_phrase = (
+        rx(r"Transaction\s+type\s+(Your\s+(?:purchase|sale))", text)
+        or rx(r"(Your\s+(?:purchase|sale))", text)
+    )
+
+    trade_date_raw = (
+        rx(r"Trade\s+date\s+(\w+\.?\s+\d+,\s+\d{4})", text)
+        or rx(r"Trade\s+[Dd]ate\s+(\w+[.,]\s*\d+[.,]\s*\d{4})", text)
+    )
+    value_date_raw = (
+        rx(r"Value\s+date\s+(\w+\.?\s+\d+,\s+\d{4})", text)
+        or rx(r"Value\s+[Dd]ate\s+(\w+[.,]\s*\d+[.,]\s*\d{4})", text)
+    )
+
+    ccy = rx(r"Currency\s+([A-Z]{3})\b", text)
+    nominal_raw = rx(r"Nominal\s+amount\s+([0-9][0-9',.]*)", text)
+    price_pct_raw = rx(r"Trade\s+price\s+([0-9.,]+)\s*\n?\s*pct", text)
+    price_raw = rx(r"Trade\s+price\s+([0-9.,]+)", text)
+
+    # Use same proven ISIN regex as other parsers
+    isin = (
+        rx(r"ISIN(?:\s+Code)?\s*[:\-]?\s*([A-Z0-9]{10,20})", text)
+        or rx(r"\bISIN\s+([A-Z]{2}[A-Z0-9]{9,12})", text)
+    )
+
+    principal_amount = rx(r"Gross\s+consideration\s+[A-Z]{3}\s+([0-9][0-9',.]*)", text)
+    accrued = rx(r"Accrued\s+interests?\s+\d+\s+days?\s+[A-Z]{3}\s+([0-9][0-9',.]*)", text)
+    total_cash = rx(r"Total\s+amount\s+[A-Z]{3}\s+([0-9][0-9',.]*)", text)
+
+    logging.info(
+        "BONDPARTNERS PDF extract: isin=%s side=%s trade_date=%s value_date=%s nominal=%s price=%s accrued=%s total=%s",
+        isin, direction_phrase, trade_date_raw, value_date_raw, nominal_raw, price_raw, accrued, total_cash,
+    )
+
+    side = normalize_side(direction_phrase, "BONDPARTNERS_PDF")
+    nominal = parse_decimal(nominal_raw)
+    price_pct = parse_decimal(price_pct_raw or price_raw)
+    price = parse_decimal(price_raw)
+    consideration = parse_decimal(principal_amount)
+    net_amount = parse_decimal(total_cash)
+
+    ref = build_generic_reference(
+        isin=isin,
+        side=side,
+        trade_date=parse_date_any(trade_date_raw, True),
+        value_date=parse_date_any(value_date_raw, True),
+        qty=None,
+        price=price if price is not None else price_pct,
+        nominal=nominal,
+    )
+
+    trade = build_trade_dict(
         internet_message_id=internet_message_id,
         source_file=source_file,
-        email_received_at=email_received_at,
+        source_type="pdf",
+        broker_name=broker_name,
+        security_name=None,
+        isin=isin,
+        side=side,
+        trade_date=parse_date_any(trade_date_raw, prefer_day_first=True),
+        value_date=parse_date_any(value_date_raw, prefer_day_first=True),
+        quantity=nominal,
+        price=price,
+        price_currency=ccy or "USD",
+        consideration=consideration,
+        commission=None,
+        net_amount=net_amount,
+        settlement_terms="DVP",
+        counterparty_reference=ref,
+        nominal=nominal,
+        price_in_percentage=price_pct,
+        accrued_interest=parse_decimal(accrued),
+        settlement_currency=ccy or "USD",
+        parser_template="BONDPARTNERS_PDF",
+        raw_json=json.dumps({
+            "direction_phrase": direction_phrase,
+            "trade_date_raw": trade_date_raw,
+            "value_date_raw": value_date_raw,
+            "nominal_raw": nominal_raw,
+            "price_raw": price_raw,
+            "price_pct_raw": price_pct_raw,
+            "principal_amount": principal_amount,
+            "accrued": accrued,
+            "total_cash": total_cash,
+            "currency": ccy,
+        }, default=str),
         processing_run_id=processing_run_id,
         file_id=file_id,
         email_id=email_id,
-        broker_name=broker_name,
-        parser_template="BONDPARTNERS_PDF",
+        side_original_text=direction_phrase,
+        trade_date_original_text=trade_date_raw,
+        value_date_original_text=value_date_raw,
     )
+
+    trade = normalize_trade_signs(trade)
+    finalize_trade_validation(trade, email_received_at)
+
+    if not trade.get("isin") and not trade.get("security_name"):
+        return []
+
+    return [trade]
 
 
 def parse_seaport_pdf(
@@ -2551,7 +2659,9 @@ def parse_seaport_pdf(
         net_amount = parse_decimal(net_raw)
         consideration = parse_decimal(gross_raw)
         accrued = parse_decimal(accrued_raw)
-        side = normalize_side(side_raw, "SEAPORT_PDF")
+        # Seaport confirmation shows Seaport's action: "Buy" = Seaport buys FROM AM Wealth = AM Wealth SELLS
+        _seaport_side = normalize_side(side_raw, "SEAPORT_PDF")
+        side = "SELL" if _seaport_side == "BUY" else ("BUY" if _seaport_side == "SELL" else _seaport_side)
 
         ref = build_generic_reference(isin, side, trade_date, value_date, quantity, price)
 
