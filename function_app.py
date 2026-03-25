@@ -2523,10 +2523,7 @@ def parse_bondpartners_pdf(text, internet_message_id, source_file, email_receive
         rx(r"Trade\s+date\s+(\w+\.?\s+\d+,\s+\d{4})", text)
         or rx(r"Trade\s+[Dd]ate\s+(\w+[.,]\s*\d+[.,]\s*\d{4})", text)
     )
-    value_date_raw = (
-        rx(r"Value\s+date\s+(\w+\.?\s+\d+,\s+\d{4})", text)
-        or rx(r"Value\s+[Dd]ate\s+(\w+[.,]\s*\d+[.,]\s*\d{4})", text)
-    )
+    value_date_raw = rx(r"Value\s+date\s*(\w+\.?\s+\d+,\s+\d{4})", text)
 
     ccy = rx(r"Currency\s+([A-Z]{3})\b", text)
     nominal_raw = rx(r"Nominal\s+amount\s+([0-9][0-9',.]*)", text)
