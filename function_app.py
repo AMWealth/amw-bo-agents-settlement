@@ -5116,8 +5116,6 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
 
     for row in result.get("detail_rows", []):
         status = row.get("status", "")
-        if status not in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING"):
-            continue
         color = STATUS_COLOR.get(status, "FFFFFF")
         data = [
             status,
@@ -5307,8 +5305,6 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
 """
     for row in result.get("detail_rows", []):
         status = row.get("status", "")
-        if status not in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING"):
-            continue
         bg = STATUS_BG.get(status, "#FFFFFF")
         label = STATUS_LABEL.get(status, status)
         cpty_ssi = row.get("cpty_ssi") or ""
