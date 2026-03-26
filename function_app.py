@@ -934,7 +934,8 @@ def upsert_settlement_trade(conn, trade: Dict[str, Any]) -> int:
                 email_id,
                 side_original_text,
                 trade_date_original_text,
-                value_date_original_text
+                value_date_original_text,
+                our_ssi
             )
             values
             (
@@ -976,7 +977,8 @@ def upsert_settlement_trade(conn, trade: Dict[str, Any]) -> int:
                 %(email_id)s,
                 %(side_original_text)s,
                 %(trade_date_original_text)s,
-                %(value_date_original_text)s
+                %(value_date_original_text)s,
+                %(our_ssi)s
             )
             on conflict (internet_message_id, counterparty_reference)
             do update set
@@ -1015,7 +1017,8 @@ def upsert_settlement_trade(conn, trade: Dict[str, Any]) -> int:
                 email_id = excluded.email_id,
                 side_original_text = excluded.side_original_text,
                 trade_date_original_text = excluded.trade_date_original_text,
-                value_date_original_text = excluded.value_date_original_text
+                value_date_original_text = excluded.value_date_original_text,
+                our_ssi = excluded.our_ssi
             returning id
             """,
             trade,
@@ -1422,6 +1425,7 @@ def build_trade_dict(
     side_original_text: Optional[str],
     trade_date_original_text: Optional[str],
     value_date_original_text: Optional[str],
+    our_ssi: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "internet_message_id": internet_message_id,
@@ -1462,6 +1466,7 @@ def build_trade_dict(
         "side_original_text": clean_text(side_original_text),
         "trade_date_original_text": clean_text(trade_date_original_text),
         "value_date_original_text": clean_text(value_date_original_text),
+        "our_ssi": clean_text(our_ssi),
     }
 
 
@@ -1662,6 +1667,10 @@ def parse_cub_pdf(
         or rx(r"(?:Reference|Confirmation\s+No\.?|Trade\s+Reference)\s*[:\-]?\s*([A-Za-z0-9\-/]+)", text)
     )
 
+    # Our SSI: "Settlement : Our EC 23867"
+    _cub_ec = rx(r"Our\s+EC\s+(\d+)", text)
+    our_ssi = f"EC {_cub_ec}" if _cub_ec else None
+
     side = normalize_side(direction_phrase, "CUB_PDF")
     nominal = parse_decimal(nominal_raw)
     price_pct = parse_decimal(price_pct_raw)
@@ -1727,6 +1736,7 @@ def parse_cub_pdf(
         side_original_text=direction_phrase,
         trade_date_original_text=trade_date_raw,
         value_date_original_text=value_date_raw,
+        our_ssi=our_ssi,
     )
 
     trade = normalize_trade_signs(trade)
@@ -2288,6 +2298,7 @@ def parse_instinet_pdf(
     # CPTY SSI: "Participant Account No B01824" → "MS-HK-CCAS/B01824"
     participant_account = rx(r"Participant\s+Account\s+No\.?\s+(\w+)", text)
     cpty_ssi = f"MS-HK-CCAS/{participant_account}" if participant_account else None
+    our_ssi = cpty_ssi
 
     ref = (
         rx(r"(?:Confirmation|Reference|Order)\s+(?:No\.?|Number)\s*[:\-]?\s*([A-Za-z0-9\-/]+)", text)
@@ -2342,6 +2353,7 @@ def parse_instinet_pdf(
         side_original_text=direction_phrase,
         trade_date_original_text=trade_date_raw,
         value_date_original_text=value_date_raw,
+        our_ssi=our_ssi,
     )
     trade = normalize_trade_signs(trade)
     finalize_trade_validation(trade, email_received_at)
@@ -2437,6 +2449,11 @@ def parse_enbd_pdf(
         or rx(r"^([0-9]{6,12})\b", text, re.MULTILINE)
     )
 
+    # Our SSI: "Account Number : 70347" in the settlement instructions section
+    # (appears after "CLEARSTREAM" or "AM WEALTH LIMITED delivers")
+    _enbd_acct = rx(r"Account\s+Number\s*:\s*(\d+)", text)
+    our_ssi = f"CLST {_enbd_acct}" if _enbd_acct else None
+
     security_name = (
         rx(r"Security\s+(?:Name|Description)\s*[:\-]?\s*(.+)", text)
         or rx(r"Instrument\s*[:\-]?\s*(.+)", text)
@@ -2494,6 +2511,7 @@ def parse_enbd_pdf(
         side_original_text=direction_phrase,
         trade_date_original_text=trade_date_raw,
         value_date_original_text=value_date_raw,
+        our_ssi=our_ssi,
     )
     trade = normalize_trade_signs(trade)
     finalize_trade_validation(trade, email_received_at)
@@ -2539,6 +2557,10 @@ def parse_bondpartners_pdf(text, internet_message_id, source_file, email_receive
     principal_amount = rx(r"Gross\s+consideration\s+[A-Z]{3}\s+([0-9][0-9',.]*)", text)
     accrued = rx(r"Accrued\s+interests?\s+\d+\s+days?\s+[A-Z]{3}\s+([0-9][0-9',.]*)", text)
     total_cash = rx(r"Total\s+amount\s+[A-Z]{3}\s+([0-9][0-9',.]*)", text)
+
+    # Our SSI: "Our settlement instructions\nEUROCLEAR BANK BRUX\nAccount number : 90439"
+    _bp_acct = rx(r"Our\s+settlement\s+instructions[\s\S]{0,200}Account\s+number\s*:\s*(\d+)", text)
+    our_ssi = f"ECLR {_bp_acct}" if _bp_acct else None
 
     logging.info(
         "BONDPARTNERS PDF extract: isin=%s side=%s trade_date=%s value_date=%s nominal=%s price=%s accrued=%s total=%s",
@@ -2603,6 +2625,7 @@ def parse_bondpartners_pdf(text, internet_message_id, source_file, email_receive
         side_original_text=direction_phrase,
         trade_date_original_text=trade_date_raw,
         value_date_original_text=value_date_raw,
+        our_ssi=our_ssi,
     )
 
     trade = normalize_trade_signs(trade)
@@ -2627,6 +2650,11 @@ def parse_seaport_pdf(
     # Format: single data row after 3-line header block
     # Columns: Side  ISIN  Quantity  Price  SettlDate  NetConsideration  Ccy  Accrued  GrossConsideration  TradeDate  InstrumentName
     # Example: "Buy XS0701227075 200000 116.75 17/02/2026 -237548.61 USD 4048.6100 -233500 12/02/2026 AM WEALTH ..."
+
+    # Our SSI: "OUR SSI : ECLR 75663"
+    _sp_acct = rx(r"OUR\s+SSI\s*:\s*ECLR\s+(\d+)", text, re.IGNORECASE)
+    our_ssi = f"ECLR {_sp_acct}" if _sp_acct else None
+
     pattern = re.compile(
         r"^(Buy|Sell)\s+"
         r"([A-Z]{2}[A-Z0-9]{9,12})\s+"
@@ -2698,6 +2726,7 @@ def parse_seaport_pdf(
             side_original_text=side_raw,
             trade_date_original_text=trade_raw,
             value_date_original_text=settle_raw,
+            our_ssi=our_ssi,
         )
         trade = normalize_trade_signs(trade)
         finalize_trade_validation(trade, email_received_at)
@@ -2767,6 +2796,10 @@ def parse_bridport_pdf(
         or rx(r"(?:Reference|Confirmation\s+No\.?)\s*[:\-]?\s*([A-Za-z0-9\-/]+)", text)
     )
 
+    # Our SSI: try Euroclear account number in settlement instructions
+    _bp_ec = rx(r"Our\s+EC\s+(\d+)", text) or rx(r"Euroclear\s+(?:account|acc\.?)\s*[:\-]?\s*(\d+)", text, re.IGNORECASE)
+    our_ssi = f"ECLR {_bp_ec}" if _bp_ec else None
+
     trade_date = parse_date_any(trade_date_raw, prefer_day_first=True)
     value_date = parse_date_any(value_date_raw, prefer_day_first=True)
     nominal = parse_decimal(nominal_raw)
@@ -2819,6 +2852,7 @@ def parse_bridport_pdf(
         side_original_text=direction_phrase,
         trade_date_original_text=trade_date_raw,
         value_date_original_text=value_date_raw,
+        our_ssi=our_ssi,
     )
     trade = normalize_trade_signs(trade)
     finalize_trade_validation(trade, email_received_at)
@@ -4351,6 +4385,7 @@ def load_settlement_trades_for_reconciliation(
                 validation_status,
                 validation_note,
                 counterparty_reference,
+                our_ssi,
                 created_at
             from back_office_auto.settlement_trades
             {where}
@@ -4977,11 +5012,8 @@ def _detail_row(
         internal_ids = ",".join(str(r["id"]) for r in agg_rows)
         counterparty = agg_rows[0].get("counterparty")
 
-    # CPTY SSI only meaningful for Instinet PDF — for other parsers counterparty_reference is a trade ref
-    if st.get("parser_template") == "INSTINET_PDF":
-        cpty_ssi = st.get("counterparty_reference") or ""
-    else:
-        cpty_ssi = ""
+    # CPTY SSI: use our_ssi (parsed settlement account) for all templates
+    cpty_ssi = st.get("our_ssi") or ""
     if td is not None:
         int_ssi = td.get("ssi_name") or ""
     elif agg_rows:
