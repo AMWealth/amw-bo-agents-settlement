@@ -1302,13 +1302,13 @@ def parse_instinet_excel(
         security_name = pick_first(rowd, ["security_name", "sec_descr", "description", "symbol_name", "security", "symbol"])
         side_raw = pick_first(rowd, ["side", "buy_sell", "b_s"])
         trade_date_raw = pick_first(rowd, ["trade_date", "tr_date", "tradedate"])
-        value_date_raw = pick_first(rowd, ["settl_date", "settlement_date", "value_date", "stl_date"])
+        value_date_raw = pick_first(rowd, ["settl_date", "settle_date", "settlement_date", "value_date", "stl_date"])
         quantity = pick_first(rowd, ["quantity", "qty", "units"])
         price = pick_first(rowd, ["price", "trade_price"])
         price_currency = pick_first(rowd, ["currency", "tr_currency", "settl_currency", "price_currency"])
         consideration = pick_first(rowd, ["consideration", "gross", "principal_amount", "amount"])
         commission = pick_first(rowd, ["commission", "brok_com", "brokerage", "broker_commission"])
-        net_amount = pick_first(rowd, ["net", "net_settle", "net_amount"])
+        net_amount = pick_first(rowd, ["net", "net_settle", "net_amount", "total_net"])
         counterparty_reference = pick_first(rowd, ["trans", "trans_no", "transaction_no", "counterparty_reference", "reference", "ref"])
 
         if not counterparty_reference:
