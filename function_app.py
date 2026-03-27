@@ -3574,6 +3574,24 @@ def _extract_ssi_hints(text: str) -> List[Dict[str, str]]:
     return unique
 
 
+# Broker name → fragment of counterparty name in tab_counterparty
+# Used when broker_name in settlement_trades doesn't match tab_counterparty directly
+_BROKER_NAME_ALIASES: Dict[str, str] = {
+    "instinet": "market securities",
+}
+
+# instr_type (from Instinet raw_json) → keyword present in ssi_name
+_INSTR_TYPE_SSI_KEYWORD: Dict[str, str] = {
+    "USE": "DTC",
+    "HKE": "HK",
+    "LSE": "CREST",
+    "EUE": "ECLR",
+    "FRE": "FRANCE",
+    "GRE": "GERMANY",
+    "SWE": "SWISS",
+}
+
+
 def enrich_cpty_ssi(
     conn,
     trade_id: int,
@@ -3591,10 +3609,12 @@ def enrich_cpty_ssi(
 
     Strategy:
       1. Extract (custodian_keyword, account) hints from raw_json text.
-      2. Find counterparty_id by matching broker_name to tab_counterparty.name.
+      2. Find counterparty_id by matching broker_name to tab_counterparty.name
+         (with alias fallback via _BROKER_NAME_ALIASES).
       3. a. Match by counterparty_id + account            (best: right broker + right account)
-         b. Match by counterparty_id only (single SSI)   (fallback: only one SSI for this broker)
-         c. Match by account across all counterparties    (last resort)
+         b. Match by counterparty_id + instr_type keyword (Instinet: USE→DTC, HKE→HK, etc.)
+         c. Match by counterparty_id only (single SSI)   (fallback: only one SSI for this broker)
+         d. Match by account across all counterparties    (last resort)
       4. If found, UPDATE settlement_trades.our_ssi.
 
     Returns the matched ssi_name or None.
@@ -3602,21 +3622,27 @@ def enrich_cpty_ssi(
     if not raw_json_str:
         return None
 
-    # Flatten raw_json to a single searchable string
+    # Flatten raw_json to a single searchable string; also keep parsed object
     try:
         raw_obj = json.loads(raw_json_str)
         text = " ".join(str(v) for v in raw_obj.values() if v is not None)
     except Exception:
+        raw_obj = {}
         text = raw_json_str
 
     hints = _extract_ssi_hints(text)
     accounts = [h["account"] for h in hints]
+
+    # instr_type keyword for market-based SSI matching (e.g. Instinet USE→DTC, HKE→HK)
+    instr_type = str(raw_obj.get("instr_type") or "").upper()
+    instr_ssi_keyword = _INSTR_TYPE_SSI_KEYWORD.get(instr_type)
 
     ssi_name: Optional[str] = None
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
 
         # Find counterparty_id by broker_name (match on name or short_name)
+        # Fallback: use _BROKER_NAME_ALIASES for brokers whose file name differs from DB name
         counterparty_id: Optional[int] = None
         if broker_name:
             cur.execute(
@@ -3630,6 +3656,23 @@ def enrich_cpty_ssi(
             cp_row = cur.fetchone()
             if cp_row:
                 counterparty_id = cp_row["id"]
+
+        # Alias fallback: broker_name not found directly in tab_counterparty
+        if not counterparty_id and broker_name:
+            alias_fragment = _BROKER_NAME_ALIASES.get(broker_name.lower())
+            if alias_fragment:
+                cur.execute(
+                    """
+                    SELECT id FROM back_office.tab_counterparty
+                    WHERE LOWER(name) LIKE %s
+                      AND role = 'Counterparty'
+                    LIMIT 1
+                    """,
+                    (f"%{alias_fragment}%",),
+                )
+                cp_row = cur.fetchone()
+                if cp_row:
+                    counterparty_id = cp_row["id"]
 
         # ── a. counterparty_id + account ──────────────────────────────────────
         if not ssi_name and counterparty_id and accounts:
@@ -3649,7 +3692,25 @@ def enrich_cpty_ssi(
             if row:
                 ssi_name = row["ssi_name"]
 
-        # ── b. counterparty_id only — single SSI ─────────────────────────────
+        # ── b. counterparty_id + instr_type keyword (e.g. Instinet USE→DTC) ─
+        if not ssi_name and counterparty_id and instr_ssi_keyword:
+            cur.execute(
+                """
+                SELECT ti.ssi_name
+                FROM back_office_auto.counterparty_ssi_mapping csm
+                JOIN back_office.tab_standard_settlement_instructions ti ON csm.ssi_id = ti.id
+                WHERE csm.counterparty_id = %s
+                  AND csm.is_active = true
+                  AND ti.ssi_name ILIKE %s
+                LIMIT 1
+                """,
+                (counterparty_id, f"%{instr_ssi_keyword}%"),
+            )
+            row = cur.fetchone()
+            if row:
+                ssi_name = row["ssi_name"]
+
+        # ── c. counterparty_id only — single SSI ─────────────────────────────
         if not ssi_name and counterparty_id:
             cur.execute(
                 """
@@ -3665,7 +3726,7 @@ def enrich_cpty_ssi(
             if len(rows) == 1:
                 ssi_name = rows[0]["ssi_name"]
 
-        # ── c. account across all counterparties ──────────────────────────────
+        # ── d. account across all counterparties ──────────────────────────────
         if not ssi_name and accounts:
             cur.execute(
                 """
