@@ -3510,7 +3510,7 @@ def parse_single_attachment(
 # CPTY SSI ENRICHMENT  (separate function — does not affect parsing logic)
 # =============================================================================
 
-# Normalize custodian keywords found in PDF/Excel text → canonical form used in cpty_ssi_mapping
+# Normalize custodian keywords found in PDF/Excel text → canonical form used in counterparty_ssi_mapping
 _CUSTODIAN_ALIASES: Dict[str, str] = {
     "euroclear": "EUROCLEAR",
     "eclr":      "EUROCLEAR",
@@ -3580,15 +3580,21 @@ def enrich_cpty_ssi(
     raw_json_str: Optional[str],
 ) -> Optional[str]:
     """
-    Look up CPTY SSI for a settlement trade using cpty_ssi_mapping.
+    Look up CPTY SSI for a settlement trade using counterparty_ssi_mapping.
+
+    Table structure:
+      back_office_auto.counterparty_ssi_mapping (counterparty_id, ssi_id, is_active)
+      → joined with back_office.tab_counterparty (id, name, short_name)
+      → joined with back_office.tab_standard_settlement_instructions (id, ssi_name, ac, agent_id)
+      → joined with back_office.tab_counterparty as agent (id=agent_id, short_name=custodian)
 
     Strategy:
-      1. Extract (custodian, account) hints from raw_json text.
-      2. Query cpty_ssi_mapping:
-         a. Exact match on broker_name + custodian + account   (best)
-         b. Match on custodian + account only                  (fallback)
-         c. Match on broker_name only (single SSI)             (last resort)
-      3. If found, UPDATE settlement_trades.our_ssi.
+      1. Extract (custodian_keyword, account) hints from raw_json text.
+      2. Find counterparty_id by matching broker_name to tab_counterparty.name.
+      3. a. Match by counterparty_id + account            (best: right broker + right account)
+         b. Match by counterparty_id only (single SSI)   (fallback: only one SSI for this broker)
+         c. Match by account across all counterparties    (last resort)
+      4. If found, UPDATE settlement_trades.our_ssi.
 
     Returns the matched ssi_name or None.
     """
@@ -3603,58 +3609,79 @@ def enrich_cpty_ssi(
         text = raw_json_str
 
     hints = _extract_ssi_hints(text)
+    accounts = [h["account"] for h in hints]
 
     ssi_name: Optional[str] = None
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
 
-        # ── a. Exact: broker_name + custodian + account ───────────────────────
-        if not ssi_name and hints:
-            for hint in hints:
-                cur.execute(
-                    """
-                    SELECT ssi_name FROM back_office_auto.cpty_ssi_mapping
-                    WHERE broker_name = %s
-                      AND UPPER(custodian) = UPPER(%s)
-                      AND UPPER(account)   = UPPER(%s)
-                    LIMIT 1
-                    """,
-                    (broker_name, hint["custodian"], hint["account"]),
-                )
-                row = cur.fetchone()
-                if row:
-                    ssi_name = row["ssi_name"]
-                    break
-
-        # ── b. Fallback: custodian + account (any broker) ────────────────────
-        if not ssi_name and hints:
-            for hint in hints:
-                cur.execute(
-                    """
-                    SELECT ssi_name FROM back_office_auto.cpty_ssi_mapping
-                    WHERE UPPER(custodian) = UPPER(%s)
-                      AND UPPER(account)   = UPPER(%s)
-                    LIMIT 1
-                    """,
-                    (hint["custodian"], hint["account"]),
-                )
-                row = cur.fetchone()
-                if row:
-                    ssi_name = row["ssi_name"]
-                    break
-
-        # ── c. Last resort: broker_name has exactly one SSI in mapping ────────
-        if not ssi_name and broker_name:
+        # Find counterparty_id by broker_name (match on name or short_name)
+        counterparty_id: Optional[int] = None
+        if broker_name:
             cur.execute(
                 """
-                SELECT ssi_name FROM back_office_auto.cpty_ssi_mapping
-                WHERE broker_name = %s
+                SELECT id FROM back_office.tab_counterparty
+                WHERE LOWER(name) = LOWER(%s) OR LOWER(short_name) = LOWER(%s)
+                LIMIT 1
                 """,
-                (broker_name,),
+                (broker_name, broker_name),
+            )
+            cp_row = cur.fetchone()
+            if cp_row:
+                counterparty_id = cp_row["id"]
+
+        # ── a. counterparty_id + account ──────────────────────────────────────
+        if not ssi_name and counterparty_id and accounts:
+            cur.execute(
+                """
+                SELECT ti.ssi_name
+                FROM back_office_auto.counterparty_ssi_mapping csm
+                JOIN back_office.tab_standard_settlement_instructions ti ON csm.ssi_id = ti.id
+                WHERE csm.counterparty_id = %s
+                  AND csm.is_active = true
+                  AND UPPER(ti.ac) = ANY(%s)
+                LIMIT 1
+                """,
+                (counterparty_id, [a.upper() for a in accounts]),
+            )
+            row = cur.fetchone()
+            if row:
+                ssi_name = row["ssi_name"]
+
+        # ── b. counterparty_id only — single SSI ─────────────────────────────
+        if not ssi_name and counterparty_id:
+            cur.execute(
+                """
+                SELECT ti.ssi_name
+                FROM back_office_auto.counterparty_ssi_mapping csm
+                JOIN back_office.tab_standard_settlement_instructions ti ON csm.ssi_id = ti.id
+                WHERE csm.counterparty_id = %s
+                  AND csm.is_active = true
+                """,
+                (counterparty_id,),
             )
             rows = cur.fetchall()
             if len(rows) == 1:
                 ssi_name = rows[0]["ssi_name"]
+
+        # ── c. account across all counterparties ──────────────────────────────
+        if not ssi_name and accounts:
+            cur.execute(
+                """
+                SELECT ti.ssi_name
+                FROM back_office_auto.counterparty_ssi_mapping csm
+                JOIN back_office.tab_standard_settlement_instructions ti ON csm.ssi_id = ti.id
+                JOIN back_office.tab_counterparty tc ON csm.counterparty_id = tc.id
+                WHERE csm.is_active = true
+                  AND UPPER(ti.ac) = ANY(%s)
+                  AND tc.role = 'Counterparty'
+                LIMIT 1
+                """,
+                ([a.upper() for a in accounts],),
+            )
+            row = cur.fetchone()
+            if row:
+                ssi_name = row["ssi_name"]
 
     if ssi_name:
         with conn.cursor() as cur:
