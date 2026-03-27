@@ -2675,6 +2675,9 @@ def parse_seaport_pdf(
 
         ref = build_generic_reference(isin, side, trade_date, value_date, quantity, price)
 
+        # Extract "OUR SSI : ECLR 75663" → account for enrich_cpty_ssi matching
+        our_ssi_raw = rx(r"OUR\s+SSI\s*:\s*(?:ECLR|EUROCLEAR|DTC|CEDE)\s+(\w+)", text)
+
         trade = build_trade_dict(
             internet_message_id=internet_message_id,
             source_file=source_file,
@@ -2704,6 +2707,7 @@ def parse_seaport_pdf(
                 "settle_raw": settle_raw, "trade_raw": trade_raw,
                 "net_raw": net_raw, "gross_raw": gross_raw,
                 "accrued_raw": accrued_raw, "ccy": ccy,
+                "our_ssi_raw": our_ssi_raw,
             }, default=str),
             processing_run_id=processing_run_id,
             file_id=file_id,
