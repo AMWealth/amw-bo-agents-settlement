@@ -934,7 +934,8 @@ def upsert_settlement_trade(conn, trade: Dict[str, Any]) -> int:
                 email_id,
                 side_original_text,
                 trade_date_original_text,
-                value_date_original_text
+                value_date_original_text,
+                our_ssi
             )
             values
             (
@@ -976,7 +977,8 @@ def upsert_settlement_trade(conn, trade: Dict[str, Any]) -> int:
                 %(email_id)s,
                 %(side_original_text)s,
                 %(trade_date_original_text)s,
-                %(value_date_original_text)s
+                %(value_date_original_text)s,
+                %(our_ssi)s
             )
             on conflict (internet_message_id, counterparty_reference)
             do update set
@@ -1015,7 +1017,8 @@ def upsert_settlement_trade(conn, trade: Dict[str, Any]) -> int:
                 email_id = excluded.email_id,
                 side_original_text = excluded.side_original_text,
                 trade_date_original_text = excluded.trade_date_original_text,
-                value_date_original_text = excluded.value_date_original_text
+                value_date_original_text = excluded.value_date_original_text,
+                our_ssi = COALESCE(excluded.our_ssi, settlement_trades.our_ssi)
             returning id
             """,
             trade,
@@ -1462,6 +1465,7 @@ def build_trade_dict(
         "side_original_text": clean_text(side_original_text),
         "trade_date_original_text": clean_text(trade_date_original_text),
         "value_date_original_text": clean_text(value_date_original_text),
+        "our_ssi": None,  # populated later by enrich_cpty_ssi()
     }
 
 
@@ -3419,8 +3423,12 @@ def parse_single_attachment(
                     continue
                 seen_keys.add(dedup_key)
 
-                upsert_settlement_trade(conn, trade)
+                trade_id = upsert_settlement_trade(conn, trade)
                 parsed_count += 1
+                try:
+                    enrich_cpty_ssi(conn, trade_id, trade.get("broker_name", ""), trade.get("raw_json"))
+                except Exception as _e:
+                    logging.warning("enrich_cpty_ssi skipped for trade %s: %s", trade_id, _e)
 
     elif file_type == "pdf":
         trades = parse_pdf_file(
@@ -3443,8 +3451,12 @@ def parse_single_attachment(
                 continue
             seen_keys.add(dedup_key)
 
-            upsert_settlement_trade(conn, trade)
+            trade_id = upsert_settlement_trade(conn, trade)
             parsed_count += 1
+            try:
+                enrich_cpty_ssi(conn, trade_id, trade.get("broker_name", ""), trade.get("raw_json"))
+            except Exception as _e:
+                logging.warning("enrich_cpty_ssi skipped for trade %s: %s", trade_id, _e)
 
     elif file_type == "zip":
         try:
@@ -3492,6 +3504,168 @@ def parse_single_attachment(
     conn.commit()
 
     return parsed_count
+
+
+# =============================================================================
+# CPTY SSI ENRICHMENT  (separate function — does not affect parsing logic)
+# =============================================================================
+
+# Normalize custodian keywords found in PDF/Excel text → canonical form used in cpty_ssi_mapping
+_CUSTODIAN_ALIASES: Dict[str, str] = {
+    "euroclear": "EUROCLEAR",
+    "eclr":      "EUROCLEAR",
+    "clearstream": "CLEARSTREAM",
+    "cedel":     "CLEARSTREAM",
+    "cede":      "CLEARSTREAM",
+    "dtc":       "DTC",
+    "crest":     "CREST",
+    "fed":       "FEDWIRE",
+    "fedwire":   "FEDWIRE",
+    "hkscc":     "HKSCC",
+    "ccas":      "HKSCC",
+    "mshk":      "HKSCC",
+    "six":       "SIX SIS",
+    "sis":       "SIX SIS",
+}
+
+# Regex patterns that extract (custodian_keyword, account) from raw text in broker files
+# Examples: "DTC 0067", "ECLR 75663", "Account number : 90439" (with EUROCLEAR context),
+#           "OUR SSI : ECLR 75663", "CEDE 83320", "Account: ... (ISNTUS33)\nDTC 0067"
+_SSI_PATTERNS = [
+    # "OUR SSI : ECLR 75663"  or  "ECLR 75663"
+    re.compile(r"\b(ECLR|EUROCLEAR|CLEARSTREAM|CEDEL|CEDE|DTC|CREST|FED|HKSCC|CCAS|MSHK|SIX|SIS)\s*[:\-]?\s*([A-Z0-9/]{3,})", re.IGNORECASE),
+    # "Account number : 90439"  (custodian detected separately from context)
+    re.compile(r"account\s+(?:number|no\.?)\s*[:\-]?\s*([A-Z0-9/]{3,})", re.IGNORECASE),
+    # "Account : Instinet, LLC (ISNTUS33)  DTC 0067"
+    re.compile(r"\bDTC\s+(\d{4,})", re.IGNORECASE),
+]
+
+
+def _extract_ssi_hints(text: str) -> List[Dict[str, str]]:
+    """
+    Extract (custodian, account) pairs from raw text.
+    Returns list of dicts with keys 'custodian' and 'account'.
+    """
+    hints: List[Dict[str, str]] = []
+    text_upper = text.upper()
+
+    # Pattern 1: "CUSTODIAN ACCOUNT" pairs
+    for m in _SSI_PATTERNS[0].finditer(text):
+        kw = m.group(1).lower()
+        acc = m.group(2).strip().strip("/").strip("-")
+        cust = _CUSTODIAN_ALIASES.get(kw)
+        if cust and acc:
+            hints.append({"custodian": cust, "account": acc})
+
+    # Pattern 2: bare "DTC XXXX"
+    for m in _SSI_PATTERNS[2].finditer(text):
+        acc = m.group(1).strip()
+        hints.append({"custodian": "DTC", "account": acc})
+
+    # Deduplicate
+    seen = set()
+    unique: List[Dict[str, str]] = []
+    for h in hints:
+        key = (h["custodian"], h["account"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(h)
+    return unique
+
+
+def enrich_cpty_ssi(
+    conn,
+    trade_id: int,
+    broker_name: str,
+    raw_json_str: Optional[str],
+) -> Optional[str]:
+    """
+    Look up CPTY SSI for a settlement trade using cpty_ssi_mapping.
+
+    Strategy:
+      1. Extract (custodian, account) hints from raw_json text.
+      2. Query cpty_ssi_mapping:
+         a. Exact match on broker_name + custodian + account   (best)
+         b. Match on custodian + account only                  (fallback)
+         c. Match on broker_name only (single SSI)             (last resort)
+      3. If found, UPDATE settlement_trades.our_ssi.
+
+    Returns the matched ssi_name or None.
+    """
+    if not raw_json_str:
+        return None
+
+    # Flatten raw_json to a single searchable string
+    try:
+        raw_obj = json.loads(raw_json_str)
+        text = " ".join(str(v) for v in raw_obj.values() if v is not None)
+    except Exception:
+        text = raw_json_str
+
+    hints = _extract_ssi_hints(text)
+
+    ssi_name: Optional[str] = None
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+        # ── a. Exact: broker_name + custodian + account ───────────────────────
+        if not ssi_name and hints:
+            for hint in hints:
+                cur.execute(
+                    """
+                    SELECT ssi_name FROM back_office_auto.cpty_ssi_mapping
+                    WHERE broker_name = %s
+                      AND UPPER(custodian) = UPPER(%s)
+                      AND UPPER(account)   = UPPER(%s)
+                    LIMIT 1
+                    """,
+                    (broker_name, hint["custodian"], hint["account"]),
+                )
+                row = cur.fetchone()
+                if row:
+                    ssi_name = row["ssi_name"]
+                    break
+
+        # ── b. Fallback: custodian + account (any broker) ────────────────────
+        if not ssi_name and hints:
+            for hint in hints:
+                cur.execute(
+                    """
+                    SELECT ssi_name FROM back_office_auto.cpty_ssi_mapping
+                    WHERE UPPER(custodian) = UPPER(%s)
+                      AND UPPER(account)   = UPPER(%s)
+                    LIMIT 1
+                    """,
+                    (hint["custodian"], hint["account"]),
+                )
+                row = cur.fetchone()
+                if row:
+                    ssi_name = row["ssi_name"]
+                    break
+
+        # ── c. Last resort: broker_name has exactly one SSI in mapping ────────
+        if not ssi_name and broker_name:
+            cur.execute(
+                """
+                SELECT ssi_name FROM back_office_auto.cpty_ssi_mapping
+                WHERE broker_name = %s
+                """,
+                (broker_name,),
+            )
+            rows = cur.fetchall()
+            if len(rows) == 1:
+                ssi_name = rows[0]["ssi_name"]
+
+    if ssi_name:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE back_office_auto.settlement_trades SET our_ssi = %s WHERE id = %s",
+                (ssi_name, trade_id),
+            )
+        conn.commit()
+        logging.info("enrich_cpty_ssi: trade %s → %s", trade_id, ssi_name)
+
+    return ssi_name
 
 
 # =============================================================================
@@ -4351,6 +4525,7 @@ def load_settlement_trades_for_reconciliation(
                 validation_status,
                 validation_note,
                 counterparty_reference,
+                our_ssi,
                 created_at
             from back_office_auto.settlement_trades
             {where}
@@ -4977,11 +5152,8 @@ def _detail_row(
         internal_ids = ",".join(str(r["id"]) for r in agg_rows)
         counterparty = agg_rows[0].get("counterparty")
 
-    # CPTY SSI only meaningful for Instinet PDF — for other parsers counterparty_reference is a trade ref
-    if st.get("parser_template") == "INSTINET_PDF":
-        cpty_ssi = st.get("counterparty_reference") or ""
-    else:
-        cpty_ssi = ""
+    # CPTY SSI: use our_ssi populated by enrich_cpty_ssi() after parsing
+    cpty_ssi = st.get("our_ssi") or ""
     if td is not None:
         int_ssi = td.get("ssi_name") or ""
     elif agg_rows:
