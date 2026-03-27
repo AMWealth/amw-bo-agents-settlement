@@ -1668,6 +1668,12 @@ def parse_cub_pdf(
         or rx(r"(?:Reference|Confirmation\s+No\.?|Trade\s+Reference)\s*[:\-]?\s*([A-Za-z0-9\-/]+)", text)
     )
 
+    # Settlement section: "Our EC 23860" or "Our DTC0902 // Custodian Account G 44695"
+    our_account_raw = (
+        rx(r"Our\s+EC\s+(\d+)", text)
+        or rx(r"Our\s+DTC\s*(\d+)", text)
+    )
+
     side = normalize_side(direction_phrase, "CUB_PDF")
     nominal = parse_decimal(nominal_raw)
     price_pct = parse_decimal(price_pct_raw)
@@ -1726,6 +1732,7 @@ def parse_cub_pdf(
             "total_cash": total_cash,
             "currency": ccy,
             "security_name": security_name,
+            "our_account_raw": our_account_raw,
         }, default=str),
         processing_run_id=processing_run_id,
         file_id=file_id,
@@ -3634,6 +3641,12 @@ def enrich_cpty_ssi(
     hints = _extract_ssi_hints(text)
     accounts = [h["account"] for h in hints]
 
+    # Also include explicit our_account_raw if present (e.g. CUB PDF: "Our EC 23860")
+    if raw_obj.get("our_account_raw"):
+        our_acc = str(raw_obj["our_account_raw"]).strip()
+        if our_acc and our_acc not in accounts:
+            accounts.append(our_acc)
+
     # instr_type keyword for market-based SSI matching (e.g. Instinet USE→DTC, HKE→HK)
     instr_type = str(raw_obj.get("instr_type") or "").upper()
     instr_ssi_keyword = _INSTR_TYPE_SSI_KEYWORD.get(instr_type)
@@ -3701,8 +3714,9 @@ def enrich_cpty_ssi(
             if cp_row:
                 counterparty_id = cp_row["id"]
 
-        # ── a. counterparty_id + account ──────────────────────────────────────
+        # ── a. counterparty_id + account (ac or agent_ac) ────────────────────
         if not ssi_name and counterparty_id and accounts:
+            accs_upper = [a.upper() for a in accounts]
             cur.execute(
                 """
                 SELECT ti.ssi_name
@@ -3710,10 +3724,10 @@ def enrich_cpty_ssi(
                 JOIN back_office.tab_standard_settlement_instructions ti ON csm.ssi_id = ti.id
                 WHERE csm.counterparty_id = %s
                   AND csm.is_active = true
-                  AND UPPER(ti.ac) = ANY(%s)
+                  AND (UPPER(ti.ac) = ANY(%s) OR UPPER(ti.agent_ac) = ANY(%s))
                 LIMIT 1
                 """,
-                (counterparty_id, [a.upper() for a in accounts]),
+                (counterparty_id, accs_upper, accs_upper),
             )
             row = cur.fetchone()
             if row:
