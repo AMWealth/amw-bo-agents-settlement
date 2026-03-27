@@ -1270,6 +1270,7 @@ def parse_gtn_excel(
             "value_date_original_text": clean_text(str(row["settlement_date_raw"])) if row["settlement_date_raw"] is not None else None,
             "validation_status": None,
             "validation_note": None,
+            "our_ssi": None,
         }
         trade = normalize_trade_signs(trade)
         trade["counterparty_reference"] = build_generic_reference(
