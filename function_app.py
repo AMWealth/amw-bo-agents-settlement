@@ -3637,6 +3637,16 @@ def enrich_cpty_ssi(
     instr_type = str(raw_obj.get("instr_type") or "").upper()
     instr_ssi_keyword = _INSTR_TYPE_SSI_KEYWORD.get(instr_type)
 
+    # Currency-based SSI keyword fallback (when instr_type not available, e.g. PDF parsers)
+    # Only used if instr_type didn't yield a keyword
+    _CURRENCY_SSI_KEYWORD: Dict[str, str] = {
+        "USD": "DTC",
+        "GBP": "CREST",
+        "HKD": "HK",
+    }
+    currency = str(raw_obj.get("settl_currency") or raw_obj.get("currency") or "").upper()
+    currency_ssi_keyword = _CURRENCY_SSI_KEYWORD.get(currency) if not instr_ssi_keyword else None
+
     ssi_name: Optional[str] = None
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -3674,6 +3684,22 @@ def enrich_cpty_ssi(
                 if cp_row:
                     counterparty_id = cp_row["id"]
 
+        # ILIKE fallback: broker_name is a substring of the full counterparty name
+        # (e.g. "Banca Zarattini" matches "Banca Zarattini & Co. SA")
+        if not counterparty_id and broker_name and len(broker_name) >= 5:
+            cur.execute(
+                """
+                SELECT id FROM back_office.tab_counterparty
+                WHERE LOWER(name) LIKE LOWER(%s)
+                  AND role = 'Counterparty'
+                LIMIT 1
+                """,
+                (f"%{broker_name}%",),
+            )
+            cp_row = cur.fetchone()
+            if cp_row:
+                counterparty_id = cp_row["id"]
+
         # ── a. counterparty_id + account ──────────────────────────────────────
         if not ssi_name and counterparty_id and accounts:
             cur.execute(
@@ -3692,8 +3718,10 @@ def enrich_cpty_ssi(
             if row:
                 ssi_name = row["ssi_name"]
 
-        # ── b. counterparty_id + instr_type keyword (e.g. Instinet USE→DTC) ─
-        if not ssi_name and counterparty_id and instr_ssi_keyword:
+        # ── b. counterparty_id + market keyword (instr_type or currency) ────────
+        # instr_type takes priority (Instinet: USE→DTC, HKE→HK); currency is fallback
+        market_keyword = instr_ssi_keyword or currency_ssi_keyword
+        if not ssi_name and counterparty_id and market_keyword:
             cur.execute(
                 """
                 SELECT ti.ssi_name
@@ -3704,7 +3732,7 @@ def enrich_cpty_ssi(
                   AND ti.ssi_name ILIKE %s
                 LIMIT 1
                 """,
-                (counterparty_id, f"%{instr_ssi_keyword}%"),
+                (counterparty_id, f"%{market_keyword}%"),
             )
             row = cur.fetchone()
             if row:
