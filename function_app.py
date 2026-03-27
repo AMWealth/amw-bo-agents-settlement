@@ -1364,6 +1364,7 @@ def parse_instinet_excel(
             "value_date_original_text": clean_text(str(value_date_raw)) if value_date_raw is not None else None,
             "validation_status": None,
             "validation_note": None,
+            "our_ssi": None,
         }
 
         if not trade["trade_date"] and trade.get("isin") and trade.get("quantity") and trade.get("price"):
