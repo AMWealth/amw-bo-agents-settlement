@@ -5574,14 +5574,19 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
 """
 
     # ── Table A: Confo vs Internal ─────────────────────────────────────────────
-    html += """<div class="sect">A. Confo vs Internal (what counterparties sent)</div>
+    _table_a_rows = [
+        r for r in result.get("detail_rows", [])
+        if r.get("status") in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING")
+        and r.get("validation_status") != "FAILED"
+    ]
+    html += f"""<div class="sect">A. Confo vs Internal — {len(_table_a_rows)} trades to process</div>
 <table>
 <tr>
   <th>Status</th><th>ISIN</th><th>Side</th><th>Trade Date</th><th>Value Date</th>
   <th>Broker</th><th>Ext Qty</th><th>Int Qty</th><th>Ext Price</th><th>Int Price</th><th>Ext Amount</th><th>Int Amount</th><th>Δ Amount</th><th>CPTY SSI</th><th>Notes</th>
 </tr>
 """
-    for row in result.get("detail_rows", []):
+    for row in _table_a_rows:
         status = row.get("status", "")
         if status not in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING"):
             continue
@@ -5701,7 +5706,10 @@ def send_reconciliation_email(token: str, result: dict, date_from, date_to) -> N
         "message": {
             "subject": subject,
             "body": {"contentType": "HTML", "content": html_body},
-            "toRecipients": [{"emailAddress": {"address": REPORT_TO}}],
+            "toRecipients": [
+                {"emailAddress": {"address": REPORT_TO}},
+                {"emailAddress": {"address": "Back.office@amwealth.ae"}},
+            ],
             "attachments": [
                 {
                     "@odata.type": "#microsoft.graph.fileAttachment",
