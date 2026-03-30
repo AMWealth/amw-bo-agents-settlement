@@ -4775,7 +4775,7 @@ def load_strict_deals_to_process(
             LEFT JOIN back_office.tab_status s
                 ON trades.status = s.id
             WHERE trades.reason = 0
-              AND trades.status NOT IN (4, 7)
+              AND trades.status NOT IN (4, 6, 7)
               AND trades.login = 1
               AND trades.type_deal <> 2
               AND trades.settle_type = 'external'
@@ -4830,7 +4830,7 @@ def load_broad_trade_search(conn) -> List[Dict[str, Any]]:
             LEFT JOIN back_office.tab_counterparty cp
                 ON trades.counterparty_id = cp.id
             WHERE trades.reason = 0
-              AND trades.status NOT IN (4, 7)
+              AND trades.status NOT IN (4, 6, 7)
               AND trades.login <> 1007
               AND trades.type_deal <> 2
               AND trades.settle_type = 'external'
@@ -4895,7 +4895,7 @@ def load_unconfirmed_deals(
             LEFT JOIN back_office.tab_status s
                 ON trades.status = s.id
             WHERE trades.reason = 0
-              AND trades.status NOT IN (4, 7)
+              AND trades.status NOT IN (4, 6, 7)
               AND trades.login = 1
               AND trades.type_deal = 2
               {extra}
