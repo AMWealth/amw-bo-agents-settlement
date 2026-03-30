@@ -6045,7 +6045,12 @@ def run_settlement_reconciliation(
     # Reverse check: internal deals that have no matching confo in this window.
     # Exclude deals whose confo exists (even if filtered by value_date) — already settled in prior run.
     # Build a set of (isin, trade_date) from all confos — for side-mismatch detection.
-    all_confo_isin_date = {(isin, td) for isin, _, td in all_confo_keys}
+    # Build lookup (isin, trade_date) → list of confos for side-mismatch detection
+    all_confo_by_isin_date: Dict[tuple, list] = {}
+    for st in all_confo_trades:
+        key = (clean_text(st.get("isin")), st.get("trade_date"))
+        all_confo_by_isin_date.setdefault(key, []).append(st)
+
     unmatched_internal = []
     for td in strict_deals:
         if td["id"] in matched_internal_ids:
@@ -6056,9 +6061,33 @@ def run_settlement_reconciliation(
         if (isin_key, side_key, date_key) in all_confo_keys:
             continue
         row = dict(td)
-        # Check if a confo exists for same ISIN+date but opposite side
-        if (isin_key, date_key) in all_confo_isin_date:
-            row["_similar_confo_note"] = "⚠️ Confo received for same ISIN but different direction — check BO entry"
+        # Check if a confo exists for same ISIN+date but different side or mismatched fields
+        similar_confos = all_confo_by_isin_date.get((isin_key, date_key), [])
+        if similar_confos:
+            st = similar_confos[0]
+            issues = []
+            # Side mismatch
+            if clean_text(st.get("side")) != side_key:
+                issues.append(f"direction: confo={st.get('side')} vs BO={td.get('direction')}")
+            # Qty/nominal mismatch
+            ext_qty = st.get("quantity") or st.get("nominal")
+            int_qty = td.get("nominal") if td.get("nominal") else td.get("qty")
+            if ext_qty is not None and int_qty is not None and not values_equal_decimal(ext_qty, int_qty):
+                issues.append(f"qty: confo={ext_qty} vs BO={int_qty}")
+            # Amount mismatch
+            ext_amt = st.get("net_amount") or st.get("consideration")
+            int_amt = td.get("net_amount") or td.get("transaction_value")
+            if ext_amt is not None and int_amt is not None and not values_equal_decimal(ext_amt, int_amt, Decimal("1")):
+                issues.append(f"amount: confo={ext_amt} vs BO={int_amt}")
+            # Price mismatch
+            ext_price = st.get("price_in_percentage") or st.get("price")
+            int_price = td.get("price_in_percentage") or td.get("price")
+            if ext_price is not None and int_price is not None and not values_equal_decimal(ext_price, int_price, Decimal("0.5")):
+                issues.append(f"price: confo={ext_price} vs BO={int_price}")
+            if issues:
+                row["_similar_confo_note"] = "⚠️ Similar confo found — " + "; ".join(issues)
+            else:
+                row["_similar_confo_note"] = "⚠️ Similar confo found — check BO entry"
         unmatched_internal.append(row)
 
     return {
