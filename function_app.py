@@ -6443,3 +6443,98 @@ def run_email_parser_http(req: func.HttpRequest) -> func.HttpResponse:
     finally:
         if conn:
             conn.close()
+
+# =============================================================================
+# TIMER TRIGGER: daily_email_parser
+# Runs every weekday at 08:30 UAE time (04:30 UTC)
+# NCRONTAB: 0 30 4 * * 1-5
+# =============================================================================
+@app.function_name(name="daily_email_parser")
+@app.timer_trigger(schedule="0 30 4 * * 1-5", arg_name="timer", run_on_startup=False, use_monitor=False)
+def daily_email_parser(timer: func.TimerRequest) -> None:
+    conn = None
+    run_id = None
+    try:
+        conn = get_conn()
+        run_id = start_agent_run(conn, "daily_email_parser")
+        token = get_graph_token()
+        mapping_by_sender, allowed_senders = load_sender_mapping(conn)
+        lookback = LOOKBACK_HOURS
+        since_dt = now_utc() - timedelta(hours=lookback)
+        total = parsed_messages = parsed_trades = skipped = 0
+        for mailbox in GRAPH_MAILBOXES:
+            messages = list_recent_messages(token, mailbox, since_dt)
+            logging.warning("EMAIL_PARSER: fetched %d messages from %s since %s", len(messages), mailbox, since_dt.isoformat())
+            for msg in messages:
+                total += 1
+                sender = normalize_email_address(msg.get("from", {}))
+                if not is_sender_allowed(sender, allowed_senders):
+                    skipped += 1
+                    continue
+                status, count = process_message(
+                    conn=conn,
+                    token=token,
+                    mailbox=mailbox,
+                    msg=msg,
+                    mapping_by_sender=mapping_by_sender,
+                    processing_run_id=run_id,
+                )
+                if status in {"PARSED", "NO_TRADES_FOUND"}:
+                    parsed_messages += 1
+                elif status in {"SKIPPED", "ALREADY_PROCESSED"}:
+                    skipped += 1
+                parsed_trades += count
+        finish_agent_run(conn, run_id, "SUCCESS",
+            f"total={total}, parsed={parsed_messages}, trades={parsed_trades}, skipped={skipped}")
+    except Exception as ex:
+        logging.exception("daily_email_parser failed: %s", ex)
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        if conn and run_id:
+            try: finish_agent_run(conn, run_id, "FAILED", str(ex))
+            except Exception: pass
+    finally:
+        if conn:
+            conn.close()
+
+
+# =============================================================================
+# TIMER TRIGGER: daily_reconciliation
+# Runs every weekday at 09:00 UAE time (05:00 UTC)
+# NCRONTAB: 0 0 5 * * 1-5
+# =============================================================================
+@app.function_name(name="daily_reconciliation")
+@app.timer_trigger(schedule="0 0 5 * * 1-5", arg_name="timer", run_on_startup=False, use_monitor=False)
+def daily_reconciliation(timer: func.TimerRequest) -> None:
+    conn = None
+    run_id = None
+    try:
+        conn = get_conn()
+        run_id = start_agent_run(conn, "daily_reconciliation")
+        t0_date, _t1_date, _t_next_date = get_t0_t1_dates()
+        confo_from = n_prev_business_days(t0_date, 2)
+        deal_from  = n_prev_business_days(t0_date, 5)
+        result = run_settlement_reconciliation(
+            conn, run_id=run_id,
+            date_from=confo_from, date_to=t0_date,
+            deal_date_from=deal_from, deal_date_to=t0_date,
+        )
+        finish_agent_run(conn, run_id, "SUCCESS",
+            f"comparison_rows={result['comparison_rows']}, matched={result['matched_count']}")
+        has_data = (result.get("comparison_rows", 0) > 0
+                    or len(result.get("unmatched_internal", [])) > 0)
+        if has_data:
+            token = get_graph_token()
+            send_reconciliation_email(token, result, confo_from, t0_date)
+    except Exception as ex:
+        logging.exception("daily_reconciliation failed: %s", ex)
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        if conn and run_id:
+            try: finish_agent_run(conn, run_id, "FAILED", str(ex))
+            except Exception: pass
+    finally:
+        if conn:
+            conn.close()
