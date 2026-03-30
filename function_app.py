@@ -4775,7 +4775,7 @@ def load_strict_deals_to_process(
             LEFT JOIN back_office.tab_status s
                 ON trades.status = s.id
             WHERE trades.reason = 0
-              AND trades.status NOT IN (6, 7)
+              AND trades.status NOT IN (4, 6, 7)
               AND trades.login = 1
               AND trades.type_deal <> 2
               AND trades.settle_type = 'external'
@@ -4830,7 +4830,7 @@ def load_broad_trade_search(conn) -> List[Dict[str, Any]]:
             LEFT JOIN back_office.tab_counterparty cp
                 ON trades.counterparty_id = cp.id
             WHERE trades.reason = 0
-              AND trades.status NOT IN (6, 7)
+              AND trades.status NOT IN (4, 6, 7)
               AND trades.login <> 1007
               AND trades.type_deal <> 2
               AND trades.settle_type = 'external'
@@ -4895,7 +4895,7 @@ def load_unconfirmed_deals(
             LEFT JOIN back_office.tab_status s
                 ON trades.status = s.id
             WHERE trades.reason = 0
-              AND trades.status NOT IN (6, 7)
+              AND trades.status NOT IN (4, 6, 7)
               AND trades.login = 1
               AND trades.type_deal = 2
               {extra}
@@ -5631,7 +5631,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
 <table>
 <tr>
   <th>Back ID</th><th>ISIN</th><th>Side</th><th>Trade Date</th><th>Value Date</th>
-  <th>Counterparty</th><th>Qty</th><th>Amount</th><th>GL Account</th>
+  <th>Counterparty</th><th>Qty</th><th>Amount</th><th>GL Account</th><th>Note</th>
 </tr>
 """
         for td in unmatched:
@@ -5645,6 +5645,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
             html += f"<td>{_fmt_num(td.get('qty'))}</td>"
             html += f"<td>{_fmt_amount(td.get('net_amount') or td.get('transaction_value'))}</td>"
             html += f"<td>{compute_gl_account(td.get('symbol', ''))}</td>"
+            html += f"<td>{td.get('_similar_confo_note') or ''}</td>"
             html += "</tr>\n"
         html += "</table>\n"
 
@@ -6043,12 +6044,22 @@ def run_settlement_reconciliation(
 
     # Reverse check: internal deals that have no matching confo in this window.
     # Exclude deals whose confo exists (even if filtered by value_date) — already settled in prior run.
-    unmatched_internal = [
-        td for td in strict_deals
-        if td["id"] not in matched_internal_ids
-        and (clean_text(td.get("symbol")), clean_text(td.get("direction")), td.get("trade_date"))
-            not in all_confo_keys
-    ]
+    # Build a set of (isin, trade_date) from all confos — for side-mismatch detection.
+    all_confo_isin_date = {(isin, td) for isin, _, td in all_confo_keys}
+    unmatched_internal = []
+    for td in strict_deals:
+        if td["id"] in matched_internal_ids:
+            continue
+        isin_key = clean_text(td.get("symbol"))
+        side_key = clean_text(td.get("direction"))
+        date_key = td.get("trade_date")
+        if (isin_key, side_key, date_key) in all_confo_keys:
+            continue
+        row = dict(td)
+        # Check if a confo exists for same ISIN+date but opposite side
+        if (isin_key, date_key) in all_confo_isin_date:
+            row["_similar_confo_note"] = "⚠️ Confo received for same ISIN but different direction — check BO entry"
+        unmatched_internal.append(row)
 
     return {
         "comparison_rows": comparison_rows,
