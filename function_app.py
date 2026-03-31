@@ -6498,7 +6498,8 @@ def daily_email_parser(timer: func.TimerRequest) -> None:
         conn = get_conn()
         run_id = start_agent_run(conn, "daily_email_parser")
         token = get_graph_token()
-        mapping_by_sender, allowed_senders = load_sender_mapping(conn)
+        mapping_by_sender = load_mapping(conn)
+        allowed_senders = get_allowed_senders(mapping_by_sender)
         lookback = LOOKBACK_HOURS
         since_dt = now_utc() - timedelta(hours=lookback)
         total = parsed_messages = parsed_trades = skipped = 0
