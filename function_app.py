@@ -3447,10 +3447,21 @@ def parse_fab_swift_pdf(
     # ISIN: line immediately after ":35B:"
     # ISIN is exactly 12 chars: 2 letters + 10 alphanumeric
     # Search only within :35B: block — avoid matching SWIFT sender/receiver codes
+    # Also try 11-char match in case PDF extraction drops first character (e.g. "US" → "S")
     isin = (
         rx(r":35B:[\s\S]{0,60}?([A-Z]{2}[A-Z0-9]{10})\b", text)
         or rx(r"Identification of the Financial Instrument[\s\S]{0,80}?([A-Z]{2}[A-Z0-9]{10})\b", text)
     )
+    # If 11-char candidate found (PDF dropped first letter), try to recover from surrounding text
+    if not isin:
+        partial = rx(r":35B:[\s\S]{0,60}?([A-Z][A-Z0-9]{10})\b", text)
+        if partial and len(partial) == 11:
+            # Search full text for 12-char ISIN ending with this partial
+            m_full = re.search(r"\b([A-Z]{2}[A-Z0-9]{10})\b", text)
+            if m_full and m_full.group(1).endswith(partial[1:]):
+                isin = m_full.group(1)
+            else:
+                isin = partial  # use as-is, better than nothing
 
     # Security name: lines after ISIN in :35B: block (skip /TS/... lines)
     security_name = None
