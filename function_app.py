@@ -5904,6 +5904,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         r for r in result.get("detail_rows", [])
         if r.get("status") in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING")
         and r.get("validation_status") != "FAILED"
+        and not r.get("instructed")
     ]
     html += f"""<div class="sect">A. Confo vs Internal — {len(_table_a_rows)} trades to process</div>
 <table>
@@ -6451,6 +6452,35 @@ def run_settlement_reconciliation(
         unmatched_internal.append(row)
 
     fab_swift_rows = run_fab_swift_reconciliation(conn, run_id=run_id)
+
+    # Mark detail_rows as INSTRUCTED if tab_deals.status=2 for the matched deal
+    instructed_deal_ids: set = set()
+    if run_id is not None:
+        with conn.cursor() as _cur:
+            _cur.execute("""
+                SELECT DISTINCT td.id
+                FROM back_office_auto.settlement_reconciliation r
+                JOIN back_office.tab_deals td ON td.id = r.internal_order_id
+                WHERE r.run_id = %s AND td.status = 2
+                UNION
+                SELECT DISTINCT TRIM(v)::int
+                FROM back_office_auto.settlement_reconciliation r
+                CROSS JOIN LATERAL unnest(string_to_array(r.matched_internal_ids, ',')) AS v
+                WHERE r.run_id = %s
+                  AND r.matched_internal_ids IS NOT NULL
+                  AND TRIM(v) ~ '^\\d+$'
+                  AND EXISTS (
+                      SELECT 1 FROM back_office.tab_deals td2
+                      WHERE td2.id = TRIM(v)::int AND td2.status = 2
+                  )
+            """, (run_id, run_id))
+            instructed_deal_ids = {row[0] for row in _cur.fetchall() if row[0]}
+
+    for row in detail_rows:
+        ids_str = row.get("int_ids") or ""
+        row_ids = {int(x.strip()) for x in ids_str.split(",") if x.strip().isdigit()}
+        if row_ids and row_ids.issubset(instructed_deal_ids):
+            row["instructed"] = True
 
     return {
         "comparison_rows": comparison_rows,
