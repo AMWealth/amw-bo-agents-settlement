@@ -3436,8 +3436,8 @@ def parse_fab_swift_pdf(
 
     side = "BUY" if mt_type == "MT545" else "SELL"
 
-    # Message reference: :20C::SEME ... 2026033002170749
-    message_ref = rx(r":20C::SEME\s+\S[^\n]*\s+(\S+)", text)
+    # Message reference: ":20C::SEME Sender's Message Reference 2026033002170749"
+    message_ref = rx(r":20C::SEME[^\n]*?(\d{16})", text)
 
     # Dates: e.g. ":98A::TRAD Trade Date/Time 2026-02-18"
     trade_date_raw = rx(r":98A::TRAD\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
@@ -3445,27 +3445,15 @@ def parse_fab_swift_pdf(
     effective_date_raw = rx(r":98A::ESET\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
 
     # ISIN: line immediately after ":35B:"
-    # ISIN is exactly 12 chars: 2 letters + 10 alphanumeric
-    # Search only within :35B: block — avoid matching SWIFT sender/receiver codes
-    # Also try 11-char match in case PDF extraction drops first character (e.g. "US" → "S")
-    isin = (
-        rx(r":35B:[\s\S]{0,60}?([A-Z]{2}[A-Z0-9]{10})\b", text)
-        or rx(r"Identification of the Financial Instrument[\s\S]{0,80}?([A-Z]{2}[A-Z0-9]{10})\b", text)
-    )
-    # If 11-char candidate found (PDF dropped first letter), try to recover from surrounding text
-    if not isin:
-        partial = rx(r":35B:[\s\S]{0,60}?([A-Z][A-Z0-9]{10})\b", text)
-        if partial and len(partial) == 11:
-            # Search full text for 12-char ISIN ending with this partial
-            m_full = re.search(r"\b([A-Z]{2}[A-Z0-9]{10})\b", text)
-            if m_full and m_full.group(1).endswith(partial[1:]):
-                isin = m_full.group(1)
-            else:
-                isin = partial  # use as-is, better than nothing
+    # ISIN is exactly 12 chars: 2 uppercase letters + 10 uppercase alphanumeric
+    # MUST use case-sensitive search to avoid matching words like "entification"
+    _isin_pat = re.compile(r":35B:[\s\S]{0,80}?([A-Z]{2}[A-Z0-9]{10})\b")
+    _m = _isin_pat.search(text)
+    isin = _m.group(1) if _m else None
 
     # Security name: lines after ISIN in :35B: block (skip /TS/... lines)
     security_name = None
-    m35 = re.search(r":35B:[\s\S]{0,60}?[A-Z]{2}[A-Z0-9]{10}\b[\n\r]+((?:/[^\n]*[\n\r]+)*)([^\n\r:]+)", text)
+    m35 = re.search(r":35B:[\s\S]{0,80}?[A-Z]{2}[A-Z0-9]{10}\b[\n\r]+((?:/[^\n]*[\n\r]+)*)([^\n\r:]+)", text)
     if m35:
         security_name = m35.group(2).strip()
 
