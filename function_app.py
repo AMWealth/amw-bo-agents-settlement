@@ -3448,9 +3448,9 @@ def parse_fab_swift_pdf(
     settlement_date_raw = rx(r":98A::SETT\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
     effective_date_raw = rx(r":98A::ESET\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
 
-    # ISIN is exactly 12 chars starting with a known 2-letter ISO country code.
-    # Restricting to valid prefixes avoids matching Bloomberg IDs (BBG...) and
-    # security name fragments (AGRIBUSINESS, RMACEUTICALS, etc.)
+    # In FAB SWIFT PDFs, the ISIN appears on the line BEFORE ":35B:"
+    # Pattern: "{ISIN}\n:35B: Identification of the Financial Instrument"
+    # Use known ISO country prefixes to avoid Bloomberg IDs (BBG...) and name fragments
     _ISIN_PREFIXES = (
         "US", "XS", "DE", "GB", "IE", "FR", "NL", "CH", "IT", "ES",
         "AU", "CA", "JP", "HK", "SG", "SE", "NO", "DK", "FI", "AT",
@@ -3459,16 +3459,21 @@ def parse_fab_swift_pdf(
         "QA", "KW", "BH", "OM", "JO", "EG", "NG", "KY", "VG", "BM",
     )
     _isin_alt = "|".join(_ISIN_PREFIXES)
-    # Search within :35B: block — case-sensitive, no re.IGNORECASE
-    _isin_pat = re.compile(r":35B:[\s\S]{0,300}?\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b")
+    # ISIN is on the line immediately before :35B: (case-sensitive)
+    _isin_pat = re.compile(r"\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b\s*\n\s*:35B:")
     _m = _isin_pat.search(text)
     isin = _m.group(1) if _m else None
+    # Fallback: ISIN anywhere before :35B: within 3 lines
+    if not isin:
+        _isin_pat2 = re.compile(r"\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b(?:[^\n]*\n){0,3}[^\n]*:35B:")
+        _m2 = _isin_pat2.search(text)
+        isin = _m2.group(1) if _m2 else None
 
-    # Security name: lines after ISIN in :35B: block (skip /TS/... lines)
+    # Security name: on the line(s) after ":35B: Identification..." (skip /TS/BBG... lines)
     security_name = None
-    m35 = re.search(r":35B:[\s\S]{0,60}?[A-Z]{2}[A-Z0-9]{10}\b[\n\r]+((?:/[^\n]*[\n\r]+)*)([^\n\r:]+)", text)
+    m35 = re.search(r":35B:[^\n]*\n((?:/[^\n]*\n)*)([^\n/:16]+)", text)
     if m35:
-        security_name = m35.group(2).strip()
+        security_name = m35.group(2).strip() or None
 
     # Face amount: ":36B::ESTT ... Face Amount 233000,"
     face_amount_raw = rx(r":36B::ESTT[^\n]*Face Amount\s+([\d,]+)", text)
