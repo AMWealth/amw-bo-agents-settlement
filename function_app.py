@@ -3434,6 +3434,10 @@ def parse_fab_swift_pdf(
     if not mt_type:
         return None
 
+    # Log first 500 chars around :35B: for debugging ISIN extraction
+    _debug_m = re.search(r".{0,100}:35B:.{0,300}", text, re.DOTALL)
+    logging.warning("FAB_SWIFT_DEBUG file=%s | 35B_context=%r", filename, _debug_m.group(0) if _debug_m else "NOT_FOUND")
+
     side = "BUY" if mt_type == "MT545" else "SELL"
 
     # Message reference: :20C::SEME ... 2026033002170749
