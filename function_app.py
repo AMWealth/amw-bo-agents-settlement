@@ -3446,14 +3446,15 @@ def parse_fab_swift_pdf(
 
     # ISIN: line immediately after ":35B:"
     # ISIN is exactly 12 chars: 2 letters + 10 alphanumeric
-    isin = rx(r":35B:[^\n]*\n([A-Z]{2}[A-Z0-9]{10})\b", text)
-    if not isin:
-        # fallback: find exactly 12-char ISIN anywhere (strict length)
-        isin = rx(r"\b([A-Z]{2}[A-Z0-9]{10})\b", text)
+    # Search only within :35B: block — avoid matching SWIFT sender/receiver codes
+    isin = (
+        rx(r":35B:[\s\S]{0,60}?([A-Z]{2}[A-Z0-9]{10})\b", text)
+        or rx(r"Identification of the Financial Instrument[\s\S]{0,80}?([A-Z]{2}[A-Z0-9]{10})\b", text)
+    )
 
-    # Security name: 2nd or 3rd line after :35B: (skip /TS/... lines)
+    # Security name: lines after ISIN in :35B: block (skip /TS/... lines)
     security_name = None
-    m35 = re.search(r":35B:[^\n]*\n[A-Z]{2}[A-Z0-9]{10}\b\n((?:/[^\n]*\n)*)([^\n:]+)", text)
+    m35 = re.search(r":35B:[\s\S]{0,60}?[A-Z]{2}[A-Z0-9]{10}\b[\n\r]+((?:/[^\n]*[\n\r]+)*)([^\n\r:]+)", text)
     if m35:
         security_name = m35.group(2).strip()
 
