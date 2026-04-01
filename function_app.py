@@ -3436,24 +3436,33 @@ def parse_fab_swift_pdf(
 
     side = "BUY" if mt_type == "MT545" else "SELL"
 
-    # Message reference: ":20C::SEME Sender's Message Reference 2026033002170749"
-    message_ref = rx(r":20C::SEME[^\n]*?(\d{16})", text)
+    # Message reference: :20C::SEME ... 2026033002170749
+    message_ref = rx(r":20C::SEME\s+\S[^\n]*\s+(\S+)", text)
 
     # Dates: e.g. ":98A::TRAD Trade Date/Time 2026-02-18"
     trade_date_raw = rx(r":98A::TRAD\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
     settlement_date_raw = rx(r":98A::SETT\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
     effective_date_raw = rx(r":98A::ESET\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
 
-    # ISIN: line immediately after ":35B:"
-    # ISIN is exactly 12 chars: 2 uppercase letters + 10 uppercase alphanumeric
-    # MUST use case-sensitive search to avoid matching words like "entification"
-    _isin_pat = re.compile(r":35B:[\s\S]{0,80}?([A-Z]{2}[A-Z0-9]{10})\b")
+    # ISIN is exactly 12 chars starting with a known 2-letter ISO country code.
+    # Restricting to valid prefixes avoids matching Bloomberg IDs (BBG...) and
+    # security name fragments (AGRIBUSINESS, RMACEUTICALS, etc.)
+    _ISIN_PREFIXES = (
+        "US", "XS", "DE", "GB", "IE", "FR", "NL", "CH", "IT", "ES",
+        "AU", "CA", "JP", "HK", "SG", "SE", "NO", "DK", "FI", "AT",
+        "BE", "LU", "PT", "GR", "CZ", "PL", "HU", "TR", "ZA", "IN",
+        "CN", "KR", "TW", "MX", "BR", "AR", "CL", "CO", "AE", "SA",
+        "QA", "KW", "BH", "OM", "JO", "EG", "NG", "KY", "VG", "BM",
+    )
+    _isin_alt = "|".join(_ISIN_PREFIXES)
+    # Search within :35B: block — case-sensitive, no re.IGNORECASE
+    _isin_pat = re.compile(r":35B:[\s\S]{0,300}?\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b")
     _m = _isin_pat.search(text)
     isin = _m.group(1) if _m else None
 
     # Security name: lines after ISIN in :35B: block (skip /TS/... lines)
     security_name = None
-    m35 = re.search(r":35B:[\s\S]{0,80}?[A-Z]{2}[A-Z0-9]{10}\b[\n\r]+((?:/[^\n]*[\n\r]+)*)([^\n\r:]+)", text)
+    m35 = re.search(r":35B:[\s\S]{0,60}?[A-Z]{2}[A-Z0-9]{10}\b[\n\r]+((?:/[^\n]*[\n\r]+)*)([^\n\r:]+)", text)
     if m35:
         security_name = m35.group(2).strip()
 
