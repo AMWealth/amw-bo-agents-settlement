@@ -670,6 +670,7 @@ SENDER_DOMAIN_FALLBACK: Dict[str, Dict[str, str]] = {
     "capitalunionbank.com": {"template_code": "CUB_PDF", "broker_name": "Capital Union Bank Ltd."},
     "emiratesnbd.com": {"template_code": "ENBD_PDF", "broker_name": "Emirates NBD"},
     "tanfeeth.ae": {"template_code": "ENBD_PDF", "broker_name": "Emirates NBD"},
+    "bankfab.com": {"template_code": "FAB_SWIFT_PDF", "broker_name": "First Abu Dhabi Bank PJSC"},
 }
 
 
