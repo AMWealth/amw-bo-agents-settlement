@@ -73,6 +73,8 @@ ALLOWED_SENDERS_FALLBACK = {
     # Emirates NBD added 2026-03-24
     "validationstryops@emiratesnbd.com",
     "confirmationstryops@tanfeeth.ae",
+    # FAB SWIFT MT545/MT547 settlement confirmations
+    "noreply@bankfab.com",
 }
 
 TEST_SENDERS_DEFAULT = [
@@ -3345,6 +3347,318 @@ def parse_pdf_file(
 
 
 # =============================================================================
+# FAB SWIFT MT545 / MT547 SETTLEMENT CONFIRMATION PARSER
+# =============================================================================
+
+def _ensure_fab_swift_table(conn) -> None:
+    """Create fab_swift_results table if it does not exist yet."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS back_office_auto.fab_swift_results (
+                id                      SERIAL PRIMARY KEY,
+                email_id                INTEGER,
+                source_file             TEXT,
+                message_ref             TEXT UNIQUE,
+                mt_type                 TEXT,
+                isin                    TEXT,
+                security_name           TEXT,
+                side                    TEXT,
+                trade_date              DATE,
+                settlement_date         DATE,
+                effective_settlement_date DATE,
+                face_amount             NUMERIC(20,4),
+                settled_amount          NUMERIC(20,4),
+                settled_currency        TEXT,
+                internal_deal_id        INTEGER,
+                match_status            TEXT,
+                match_note              TEXT,
+                internal_amount         NUMERIC(20,4),
+                internal_face_amount    NUMERIC(20,4),
+                run_id                  INTEGER,
+                created_at              TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        """)
+    conn.commit()
+
+
+def _upsert_fab_swift_result(conn, result: Dict[str, Any]) -> int:
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO back_office_auto.fab_swift_results
+                (email_id, source_file, message_ref, mt_type, isin, security_name,
+                 side, trade_date, settlement_date, effective_settlement_date,
+                 face_amount, settled_amount, settled_currency, run_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (message_ref) DO UPDATE SET
+                email_id   = EXCLUDED.email_id,
+                run_id     = EXCLUDED.run_id
+            RETURNING id
+        """, (
+            result.get("email_id"),
+            result.get("source_file"),
+            result.get("message_ref"),
+            result.get("mt_type"),
+            result.get("isin"),
+            result.get("security_name"),
+            result.get("side"),
+            result.get("trade_date"),
+            result.get("settlement_date"),
+            result.get("effective_settlement_date"),
+            result.get("face_amount"),
+            result.get("settled_amount"),
+            result.get("settled_currency"),
+            result.get("run_id"),
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
+
+
+def parse_fab_swift_pdf(
+    text: str,
+    filename: str,
+    email_id: Optional[int],
+    processing_run_id: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    """Parse FAB SWIFT MT545/MT547 settlement confirmation PDF.
+    MT545 = Receive Against Payment = BUY (AM Wealth receives securities)
+    MT547 = Deliver Against Payment = SELL (AM Wealth delivers securities)
+    """
+    # Detect MT type from text
+    mt_type = None
+    if re.search(r"MT547", text):
+        mt_type = "MT547"
+    elif re.search(r"MT545", text):
+        mt_type = "MT545"
+    if not mt_type:
+        return None
+
+    side = "BUY" if mt_type == "MT545" else "SELL"
+
+    # Message reference: :20C::SEME ... 2026033002170749
+    message_ref = rx(r":20C::SEME\s+\S[^\n]*\s+(\S+)", text)
+
+    # Dates: e.g. ":98A::TRAD Trade Date/Time 2026-02-18"
+    trade_date_raw = rx(r":98A::TRAD\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
+    settlement_date_raw = rx(r":98A::SETT\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
+    effective_date_raw = rx(r":98A::ESET\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
+
+    # ISIN: line immediately after ":35B:"
+    isin = rx(r":35B:[^\n]*\n([A-Z]{2}[A-Z0-9]{9,12})", text)
+    if not isin:
+        isin = rx(r"\b([A-Z]{2}[A-Z0-9]{9,12})\b", text)
+
+    # Security name: 2nd or 3rd line after :35B: (skip /TS/... lines)
+    security_name = None
+    m35 = re.search(r":35B:[^\n]*\n[A-Z]{2}[A-Z0-9]{9,12}\n((?:/[^\n]*\n)*)([^\n:]+)", text)
+    if m35:
+        security_name = m35.group(2).strip()
+
+    # Face amount: ":36B::ESTT ... Face Amount 233000,"
+    face_amount_raw = rx(r":36B::ESTT[^\n]*Face Amount\s+([\d,]+)", text)
+    if face_amount_raw:
+        face_amount_raw = face_amount_raw.replace(",", "")
+    face_amount = parse_decimal(face_amount_raw)
+
+    # Settled amount and currency: ":19A::ESTT Settled Amount USD 479643,20"
+    settled_currency = rx(r":19A::ESTT[^\n]*Settled Amount\s+([A-Z]{3})", text)
+    settled_amount_raw = rx(r":19A::ESTT[^\n]*Settled Amount\s+[A-Z]{3}\s+([\d,]+(?:\.\d+)?)", text)
+    settled_amount = None
+    if settled_amount_raw:
+        # European decimal comma: "479643,20" → "479643.20"; thousand separator: "1,234,567" → remove commas
+        if re.search(r",\d{1,2}$", settled_amount_raw):
+            settled_amount = parse_decimal(settled_amount_raw.replace(",", "."))
+        else:
+            settled_amount = parse_decimal(settled_amount_raw.replace(",", ""))
+
+    return {
+        "email_id": email_id,
+        "source_file": filename,
+        "message_ref": message_ref,
+        "mt_type": mt_type,
+        "isin": isin,
+        "security_name": security_name,
+        "side": side,
+        "trade_date": parse_date_any(trade_date_raw),
+        "settlement_date": parse_date_any(settlement_date_raw),
+        "effective_settlement_date": parse_date_any(effective_date_raw),
+        "face_amount": face_amount,
+        "settled_amount": settled_amount,
+        "settled_currency": settled_currency or "USD",
+        "run_id": processing_run_id,
+    }
+
+
+def _process_fab_swift_message(
+    conn,
+    token: str,
+    mailbox: str,
+    msg: Dict[str, Any],
+    internet_message_id: str,
+    subject: str,
+    received_at,
+    processing_run_id: int,
+) -> Tuple[str, int]:
+    """Handle FAB SWIFT MT545/MT547 emails — parse PDFs and store to fab_swift_results."""
+    _ensure_fab_swift_table(conn)
+
+    if email_already_processed(conn, internet_message_id):
+        return ("ALREADY_PROCESSED", 0)
+
+    message_id = msg["id"]
+    attachments = get_message_attachments(token, mailbox, message_id)
+
+    email_id = insert_settlement_email(
+        conn=conn,
+        internet_message_id=internet_message_id,
+        message_id=message_id,
+        sender="noreply@bankfab.com",
+        subject=subject,
+        received_at=received_at,
+        status="RECEIVED",
+        note="FAB SWIFT MT545/MT547 received",
+        mailbox=mailbox,
+        attachment_count=len(attachments),
+        parsed_trade_count=0,
+        processing_run_id=processing_run_id,
+    )
+
+    parsed_count = 0
+    for att in attachments:
+        if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
+            continue
+        filename = att.get("name") or "unnamed"
+        if not filename.lower().endswith(".pdf"):
+            continue
+        content_b64 = att.get("contentBytes")
+        if not content_b64:
+            continue
+        file_bytes = base64.b64decode(content_b64)
+        text = extract_pdf_text(file_bytes)
+        result = parse_fab_swift_pdf(text, filename, email_id, processing_run_id)
+        if result and result.get("isin"):
+            _upsert_fab_swift_result(conn, result)
+            parsed_count += 1
+
+    status = "PARSED" if parsed_count > 0 else "NO_TRADES_FOUND"
+    insert_settlement_email(
+        conn=conn,
+        internet_message_id=internet_message_id,
+        message_id=message_id,
+        sender="noreply@bankfab.com",
+        subject=subject,
+        received_at=received_at,
+        status=status,
+        note=f"FAB SWIFT parsed: {parsed_count}",
+        mailbox=mailbox,
+        attachment_count=len(attachments),
+        parsed_trade_count=parsed_count,
+        processing_run_id=processing_run_id,
+    )
+    return (status, parsed_count)
+
+
+def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Match recent fab_swift_results against tab_deals (status=INSTRUCTED=2)
+    by ISIN + settlement_date + side. Compare settled_amount vs internal amount."""
+    _ensure_fab_swift_table(conn)
+
+    # Load FAB SWIFT records from last 10 days
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT id, message_ref, mt_type, isin, security_name, side,
+                   trade_date, settlement_date, effective_settlement_date,
+                   face_amount, settled_amount, settled_currency, email_id
+            FROM back_office_auto.fab_swift_results
+            WHERE settlement_date >= CURRENT_DATE - INTERVAL '10 days'
+            ORDER BY settlement_date DESC, id DESC
+        """)
+        swift_rows = [dict(r) for r in cur.fetchall()]
+
+    results = []
+    for sw in swift_rows:
+        isin = (sw.get("isin") or "").upper().strip()
+        side = (sw.get("side") or "").upper()
+        sett_date = sw.get("settlement_date")
+
+        # Map side to action: BUY=0, SELL=1
+        action_val = 0 if side == "BUY" else 1
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT td.id, td.symbol, td.qty, td.nominal, td.transaction_value,
+                       td.action, td.status, td.settle_date_cash, td.value_date_cash,
+                       td.currency_pay,
+                       td.transaction_value + (
+                           CASE WHEN td.action = 0 THEN -td.execution_cost
+                           ELSE td.execution_cost END
+                       ) AS net_amount,
+                       cp.name AS counterparty
+                FROM back_office.tab_deals td
+                LEFT JOIN back_office.tab_counterparty cp ON td.counterparty_id = cp.id
+                WHERE td.symbol = %s
+                  AND td.action = %s
+                  AND td.status = 2
+                  AND td.settle_type = 'external'
+                  AND td.reason = 0
+                  AND (td.settle_date_cash = %s OR td.value_date_cash = %s)
+                ORDER BY td.id DESC
+                LIMIT 5
+            """, (isin, action_val, sett_date, sett_date))
+            candidates = [dict(r) for r in cur.fetchall()]
+
+        sw_amount = sw.get("settled_amount")
+        sw_face = sw.get("face_amount")
+
+        if not candidates:
+            row = dict(sw)
+            row["match_status"] = "NOT_FOUND"
+            row["match_note"] = "No INSTRUCTED deal found for ISIN+date+side"
+            row["internal_deal_id"] = None
+            row["internal_amount"] = None
+            row["internal_face_amount"] = None
+            row["counterparty"] = None
+        else:
+            best = candidates[0]
+            int_amount = best.get("net_amount") or best.get("transaction_value")
+            int_face = best.get("nominal") or best.get("qty")
+
+            amount_ok = (sw_amount is not None and int_amount is not None
+                         and values_equal_decimal(sw_amount, int_amount, Decimal("1")))
+
+            if amount_ok:
+                match_status = "MATCHED"
+                match_note = None
+            else:
+                match_status = "AMOUNT_MISMATCH"
+                match_note = f"settled={sw_amount} vs internal={int_amount}"
+
+            row = dict(sw)
+            row["match_status"] = match_status
+            row["match_note"] = match_note
+            row["internal_deal_id"] = best.get("id")
+            row["internal_amount"] = int_amount
+            row["internal_face_amount"] = int_face
+            row["counterparty"] = best.get("counterparty")
+
+            # Update match result in DB
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE back_office_auto.fab_swift_results
+                    SET match_status = %s, match_note = %s,
+                        internal_deal_id = %s, internal_amount = %s,
+                        internal_face_amount = %s, run_id = %s
+                    WHERE id = %s
+                """, (match_status, match_note, best.get("id"),
+                      int_amount, int_face, run_id, sw["id"]))
+            conn.commit()
+
+        results.append(row)
+
+    return results
+
+
+# =============================================================================
 # ATTACHMENT PROCESSING
 # =============================================================================
 def parse_single_attachment(
@@ -4285,6 +4599,17 @@ def process_message(
             parsed_trade_count=0,
             processing_run_id=processing_run_id,
         )
+        return ("SKIPPED", 0)
+
+    # FAB SWIFT MT545/MT547: route to dedicated handler, skip normal pipeline
+    if sender == "noreply@bankfab.com":
+        subj_upper = (subject or "").upper()
+        if "MT545" in subj_upper or "MT547" in subj_upper:
+            return _process_fab_swift_message(
+                conn=conn, token=token, mailbox=mailbox, msg=msg,
+                internet_message_id=internet_message_id, subject=subject,
+                received_at=received_at, processing_run_id=processing_run_id,
+            )
         return ("SKIPPED", 0)
 
     if sender == "bo.tdsm@zarattinibank.ch" and "confirmation" not in subject.lower():
@@ -5675,6 +6000,40 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
             html += "</tr>\n"
         html += "</table>\n"
 
+    # ── Table D: FAB SWIFT MT545/MT547 Settlement Confirmations ──────────────
+    fab_swift_rows = result.get("fab_swift_rows", [])
+    if fab_swift_rows:
+        html += """<div class="sect">D. FAB SWIFT Settlement Confirmations (MT545/MT547)</div>
+<table>
+<tr>
+  <th>MT Type</th><th>ISIN</th><th>Side</th><th>Settlement Date</th>
+  <th>Face Amount</th><th>Settled Amount (CCY)</th>
+  <th>Internal Deal</th><th>Internal Amount</th><th>Status</th><th>Note</th>
+</tr>
+"""
+        for sw in fab_swift_rows:
+            status = sw.get("match_status") or ""
+            if status == "MATCHED":
+                color = "#E2EFDA"
+            elif status == "AMOUNT_MISMATCH":
+                color = "#FCE4D6"
+            else:
+                color = "#FFF2CC"
+            ccy = sw.get("settled_currency") or ""
+            html += f'<tr style="background:{color}">'
+            html += f"<td><b>{sw.get('mt_type') or ''}</b></td>"
+            html += f"<td>{sw.get('isin') or ''}</td>"
+            html += f"<td>{sw.get('side') or ''}</td>"
+            html += f"<td>{_fmt_date(sw.get('settlement_date'))}</td>"
+            html += f"<td>{_fmt_num(sw.get('face_amount'))}</td>"
+            html += f"<td>{_fmt_amount(sw.get('settled_amount'))} {ccy}</td>"
+            html += f"<td>{sw.get('internal_deal_id') or '—'}</td>"
+            html += f"<td>{_fmt_amount(sw.get('internal_amount'))}</td>"
+            html += f"<td>{status}</td>"
+            html += f"<td>{sw.get('match_note') or ''}</td>"
+            html += "</tr>\n"
+        html += "</table>\n"
+
     html += "<div style='color:#888; font-size:11px; margin-top:20px'>Generated by AM Wealth Settlement Agent</div>"
     html += "</body></html>"
     return html
@@ -6090,6 +6449,8 @@ def run_settlement_reconciliation(
                 row["_similar_confo_note"] = "⚠️ Similar confo found — check BO entry"
         unmatched_internal.append(row)
 
+    fab_swift_rows = run_fab_swift_reconciliation(conn, run_id=run_id)
+
     return {
         "comparison_rows": comparison_rows,
         "matched_count": matched_count,
@@ -6100,6 +6461,7 @@ def run_settlement_reconciliation(
         "detail_rows": detail_rows,
         "unmatched_internal": unmatched_internal,
         "unconfirmed_deals": unconfirmed_deals,
+        "fab_swift_rows": fab_swift_rows,
     }
 
 
