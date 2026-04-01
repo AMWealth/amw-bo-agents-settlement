@@ -3445,13 +3445,15 @@ def parse_fab_swift_pdf(
     effective_date_raw = rx(r":98A::ESET\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
 
     # ISIN: line immediately after ":35B:"
-    isin = rx(r":35B:[^\n]*\n([A-Z]{2}[A-Z0-9]{9,12})", text)
+    # ISIN is exactly 12 chars: 2 letters + 10 alphanumeric
+    isin = rx(r":35B:[^\n]*\n([A-Z]{2}[A-Z0-9]{10})\b", text)
     if not isin:
-        isin = rx(r"\b([A-Z]{2}[A-Z0-9]{9,12})\b", text)
+        # fallback: find exactly 12-char ISIN anywhere (strict length)
+        isin = rx(r"\b([A-Z]{2}[A-Z0-9]{10})\b", text)
 
     # Security name: 2nd or 3rd line after :35B: (skip /TS/... lines)
     security_name = None
-    m35 = re.search(r":35B:[^\n]*\n[A-Z]{2}[A-Z0-9]{9,12}\n((?:/[^\n]*\n)*)([^\n:]+)", text)
+    m35 = re.search(r":35B:[^\n]*\n[A-Z]{2}[A-Z0-9]{10}\b\n((?:/[^\n]*\n)*)([^\n:]+)", text)
     if m35:
         security_name = m35.group(2).strip()
 
