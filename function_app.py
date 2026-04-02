@@ -2544,6 +2544,8 @@ def parse_enbd_securities_pdf(
     #   NET               : 3,639.18
     # Direction is NOT inverted — "Sell Confirmation" = AM Wealth SOLD
 
+    logging.warning("ENBD_SECURITIES_DEBUG RAW TEXT START >>>\n%s\n<<< ENBD_SECURITIES_DEBUG RAW TEXT END", text)
+
     isin = (
         rx(r"ISIN\s*[:\-]?\s*([A-Z]{2}[A-Z0-9]{9,12})", text)
         or rx(r"\b([A-Z]{2}[A-Z0-9]{9,12})\b", text)
@@ -3476,7 +3478,14 @@ def parse_pdf_file(
     if template_code == "ENBD_PDF":
         # ENBD Securities "Order Confirmation Report" (equity, SincyJO@emiratesnbd.com)
         # uses a different format from the bond confirmation — detect by PDF content
-        if "Order Confirmation Report" in text or "Sell Confirmation" in text or "Buy Confirmation" in text:
+        has_order_report = "Order Confirmation Report" in text
+        has_sell_confo = "Sell Confirmation" in text
+        has_buy_confo = "Buy Confirmation" in text
+        logging.warning(
+            "ENBD_ROUTING sender=%s file=%s order_report=%s sell_confo=%s buy_confo=%s",
+            sender, filename, has_order_report, has_sell_confo, has_buy_confo,
+        )
+        if has_order_report or has_sell_confo or has_buy_confo:
             return parse_enbd_securities_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
         return parse_enbd_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
