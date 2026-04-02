@@ -6076,7 +6076,6 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         r for r in result.get("detail_rows", [])
         if r.get("status") in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING")
         and r.get("validation_status") != "FAILED"
-        and not r.get("instructed")
     ]
     html += f"""<div class="sect">A. Confo vs Internal — {len(_table_a_rows)} trades to process</div>
 <table>
@@ -6089,14 +6088,18 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         status = row.get("status", "")
         if status not in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING"):
             continue
+        is_instructed = row.get("instructed", False)
         bg = STATUS_BG.get(status, "#FFFFFF")
+        row_style = f'background:{bg};opacity:0.6' if is_instructed else f'background:{bg}'
         label = STATUS_LABEL.get(status, status)
+        if is_instructed:
+            label = f"{label} ✅ INSTRUCTED"
         cpty_ssi = row.get("cpty_ssi") or ""
         int_ssi = row.get("int_ssi") or ""
         ssi_mismatch = cpty_ssi and int_ssi and cpty_ssi != int_ssi
         ssi_cls = ' class="mismatch"' if ssi_mismatch else ""
         ssi_display = cpty_ssi or "&nbsp;"
-        html += f'<tr style="background:{bg}">'
+        html += f'<tr style="{row_style}">'
         html += f"<td><b>{label}</b></td>"
         html += f"<td>{row.get('isin') or ''}</td>"
         html += f"<td>{row.get('side') or ''}</td>"
