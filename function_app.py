@@ -5466,7 +5466,14 @@ def try_aggregate_match(
         )
 
         if qty_ok and amount_ok:
-            return rows, "MATCHED_AGGREGATED", f"matched against {len(rows)} internal rows"
+            # Build note with any field mismatches vs confo
+            issues = []
+            if st.get("value_date") and rows[0].get("settle_date_cash") or rows[0].get("value_date_cash"):
+                int_vd = rows[0].get("settle_date_cash") or rows[0].get("value_date_cash")
+                if st.get("value_date") != int_vd:
+                    issues.append(f"value_date: confo={st.get('value_date')} vs BO={int_vd}")
+            note = "; ".join(issues) if issues else f"matched against {len(rows)} internal rows"
+            return rows, "MATCHED_AGGREGATED", note
 
     return None, None, None
 
