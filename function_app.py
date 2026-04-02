@@ -75,6 +75,8 @@ ALLOWED_SENDERS_FALLBACK = {
     "confirmationstryops@tanfeeth.ae",
     # FAB SWIFT MT545/MT547 settlement confirmations
     "noreply@bankfab.com",
+    # ENBD Securities Order Confirmation Reports (GCM / Sincy Joji)
+    "sincyjo@emiratesnbd.com",
 }
 
 TEST_SENDERS_DEFAULT = [
@@ -2519,6 +2521,136 @@ def parse_enbd_pdf(
     return [trade]
 
 
+def parse_enbd_securities_pdf(
+    text: str,
+    internet_message_id: str,
+    source_file: str,
+    email_received_at: Optional[datetime],
+    processing_run_id: Optional[int],
+    file_id: Optional[int],
+    email_id: Optional[int],
+    broker_name: str,
+) -> List[Dict[str, Any]]:
+    # Format: ENBD Securities "Order Confirmation Report" (GCM / Sincy Joji)
+    # Sample fields:
+    #   ISIN              : AEE01657D252
+    #   Symbol            : DUBAIRESI
+    #   Sell Confirmation / Buy Confirmation  (direct: matches AM Wealth perspective)
+    #   Transaction Date  : 01-Apr-2026  (or "April 1, 2026" etc.)
+    #   Quantity          : 3,268
+    #   Price             : 1.12000
+    #   Trading Amount    : 3,660.16
+    #   Settlement Date   : 06-Apr-2026
+    #   NET               : 3,639.18
+    # Direction is NOT inverted — "Sell Confirmation" = AM Wealth SOLD
+
+    isin = (
+        rx(r"ISIN\s*[:\-]?\s*([A-Z]{2}[A-Z0-9]{9,12})", text)
+        or rx(r"\b([A-Z]{2}[A-Z0-9]{9,12})\b", text)
+    )
+
+    security_name = rx(r"Symbol\s*[:\-]?\s*(\S+)", text)
+
+    # Detect direction from confirmation header
+    sell_match = rx(r"(Sell\s+Confirmation)", text, re.IGNORECASE)
+    buy_match = rx(r"(Buy\s+Confirmation)", text, re.IGNORECASE)
+    if sell_match:
+        side = "SELL"
+        direction_phrase = sell_match
+    elif buy_match:
+        side = "BUY"
+        direction_phrase = buy_match
+    else:
+        side = None
+        direction_phrase = None
+
+    trade_date_raw = (
+        rx(r"Transaction\s+Date\s*[:\-]?\s*(\S+)", text)
+        or rx(r"Trade\s+Date\s*[:\-]?\s*(\S+)", text)
+    )
+    value_date_raw = rx(r"Settlement\s+Date\s*[:\-]?\s*(\S+)", text)
+
+    quantity_raw = (
+        rx(r"Quantity\s*[:\-]?\s*([0-9,\.]+)", text)
+        or rx(r"No\.?\s+of\s+Shares\s*[:\-]?\s*([0-9,\.]+)", text)
+    )
+    price_raw = rx(r"Price\s*[:\-]?\s*([0-9,\.]+)", text)
+    trading_amount_raw = (
+        rx(r"Trading\s+Amount\s*[:\-]?\s*([0-9,\.]+)", text)
+        or rx(r"Gross\s+Amount\s*[:\-]?\s*([0-9,\.]+)", text)
+    )
+    net_raw = (
+        rx(r"\bNET\b\s*[:\-]?\s*([0-9,\.]+)", text)
+        or rx(r"Net\s+Amount\s*[:\-]?\s*([0-9,\.]+)", text)
+        or rx(r"Net\s+Consideration\s*[:\-]?\s*([0-9,\.]+)", text)
+    )
+
+    ccy = rx(r"\b(USD|AED|EUR|GBP|CHF)\b", text)
+
+    ref = (
+        rx(r"(?:Order|Confirmation|Reference|Transaction)\s*(?:No\.?|Number|Ref\.?|ID)\s*[:\-]?\s*([A-Za-z0-9\-/]+)", text)
+        or rx(r"^([0-9]{5,12})\b", text, re.MULTILINE)
+    )
+
+    trade_date = parse_date_any(trade_date_raw, prefer_day_first=True)
+    value_date = parse_date_any(value_date_raw, prefer_day_first=True)
+    quantity = parse_decimal(quantity_raw)
+    price = parse_decimal(price_raw)
+    trading_amount = parse_decimal(trading_amount_raw)
+    net_amount = parse_decimal(net_raw)
+
+    if not ref:
+        ref = build_generic_reference(isin, side, trade_date, value_date, quantity, price, None)
+
+    trade = build_trade_dict(
+        internet_message_id=internet_message_id,
+        source_file=source_file,
+        source_type="pdf",
+        broker_name=broker_name,
+        security_name=security_name,
+        isin=isin,
+        side=side,
+        trade_date=trade_date,
+        value_date=value_date,
+        quantity=quantity,
+        price=price,
+        price_currency=ccy or "AED",
+        consideration=trading_amount,
+        commission=None,
+        net_amount=net_amount or trading_amount,
+        settlement_terms="DVP",
+        counterparty_reference=ref,
+        nominal=None,
+        price_in_percentage=None,
+        accrued_interest=None,
+        settlement_currency=ccy or "AED",
+        parser_template="ENBD_SECURITIES_PDF",
+        raw_json=json.dumps({
+            "direction_phrase": direction_phrase,
+            "trade_date_raw": trade_date_raw,
+            "value_date_raw": value_date_raw,
+            "quantity_raw": quantity_raw,
+            "price_raw": price_raw,
+            "trading_amount_raw": trading_amount_raw,
+            "net_raw": net_raw,
+            "currency": ccy,
+            "security_name": security_name,
+        }, default=str),
+        processing_run_id=processing_run_id,
+        file_id=file_id,
+        email_id=email_id,
+        side_original_text=direction_phrase,
+        trade_date_original_text=trade_date_raw,
+        value_date_original_text=value_date_raw,
+    )
+    trade = normalize_trade_signs(trade)
+    finalize_trade_validation(trade, email_received_at)
+
+    if not trade.get("isin") and not trade.get("security_name"):
+        return []
+    return [trade]
+
+
 def parse_bondpartners_pdf(text, internet_message_id, source_file, email_received_at, processing_run_id, file_id, email_id, broker_name):
     logging.warning("BONDPARTNERS_PDF RAW TEXT START >>>\n%s\n<<< BONDPARTNERS_PDF RAW TEXT END", text)
     # Format: Bondpartners SA contract note
@@ -3342,6 +3474,10 @@ def parse_pdf_file(
         return parse_instinet_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
     if template_code == "ENBD_PDF":
+        # ENBD Securities "Order Confirmation Report" (equity, SincyJO@emiratesnbd.com)
+        # uses a different format from the bond confirmation — detect by PDF content
+        if "Order Confirmation Report" in text or "Sell Confirmation" in text or "Buy Confirmation" in text:
+            return parse_enbd_securities_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
         return parse_enbd_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
     return []
