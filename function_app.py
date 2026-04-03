@@ -2566,21 +2566,35 @@ def parse_enbd_securities_pdf(
         side = None
         direction_phrase = None
 
-    trade_date_raw = (
-        rx(r"Transaction\s+Date\s*[:\-]?\s*(\S+)", text)
-        or rx(r"Trade\s+Date\s*[:\-]?\s*(\S+)", text)
+    # The table data row is: OrderNo  DD-Mon-YYYY  Qty  Price  TradingAmt  DD-Mon-YYYY
+    # e.g. "4008352012 02-Apr-2026 3,268 1.12000 3,660.16 06-Apr-2026"
+    _data_row = re.search(
+        r"\b\d{7,12}\s+(\d{2}-[A-Za-z]{3}-\d{4})\s+([\d,]+)\s+([\d.]+)\s+([\d,\.]+)\s+(\d{2}-[A-Za-z]{3}-\d{4})\b",
+        text,
     )
-    value_date_raw = rx(r"Settlement\s+Date\s*[:\-]?\s*(\S+)", text)
-
-    quantity_raw = (
-        rx(r"Quantity\s*[:\-]?\s*([0-9,\.]+)", text)
-        or rx(r"No\.?\s+of\s+Shares\s*[:\-]?\s*([0-9,\.]+)", text)
-    )
-    price_raw = rx(r"Price\s*[:\-]?\s*([0-9,\.]+)", text)
-    trading_amount_raw = (
-        rx(r"Trading\s+Amount\s*[:\-]?\s*([0-9,\.]+)", text)
-        or rx(r"Gross\s+Amount\s*[:\-]?\s*([0-9,\.]+)", text)
-    )
+    if _data_row:
+        trade_date_raw    = _data_row.group(1)
+        quantity_raw      = _data_row.group(2)
+        price_raw         = _data_row.group(3)
+        trading_amount_raw = _data_row.group(4)
+        value_date_raw    = _data_row.group(5)
+    else:
+        trade_date_raw = (
+            rx(r"From\s+Date\s+(\d{2}-[A-Za-z]{3}-\d{4})", text)
+            or rx(r"Transaction\s+Date\s+(\d{2}-[A-Za-z]{3}-\d{4})", text)
+            or rx(r"Trade\s+Date\s*[:\-]?\s*(\S+)", text)
+        )
+        value_date_raw = rx(r"Settlement\s+Date\s+(\d{2}-[A-Za-z]{3}-\d{4})", text)
+        quantity_raw = (
+            rx(r"Total\s+([\d,]+)\s+[\d,\.]+", text)
+            or rx(r"Quantity\s*[:\-]?\s*([\d,\.]+)", text)
+            or rx(r"No\.?\s+of\s+Shares\s*[:\-]?\s*([0-9,\.]+)", text)
+        )
+        price_raw = (
+            rx(r"Gross\s+Avg\s+Price\s+([\d.]+)", text)
+            or rx(r"Net\s+Avg\s+Price\s+([\d.]+)", text)
+        )
+        trading_amount_raw = rx(r"Total\s+[\d,]+\s+([\d,\.]+)", text)
     net_raw = (
         rx(r"\bNET\b\s*[:\-]?\s*([0-9,\.]+)", text)
         or rx(r"Net\s+Amount\s*[:\-]?\s*([0-9,\.]+)", text)
