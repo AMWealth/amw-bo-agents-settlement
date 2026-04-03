@@ -3536,6 +3536,16 @@ def _ensure_fab_swift_table(conn) -> None:
         ]:
             cur.execute(f"ALTER TABLE back_office_auto.fab_swift_results {col_def}")
     conn.commit()
+    # Add unique constraint on email_id (idempotent via exception handling)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                ALTER TABLE back_office_auto.fab_swift_results
+                ADD CONSTRAINT fab_swift_results_email_id_uq UNIQUE (email_id)
+            """)
+        conn.commit()
+    except Exception:
+        conn.rollback()
 
 
 def _upsert_fab_swift_result(conn, result: Dict[str, Any]) -> int:
@@ -3546,9 +3556,20 @@ def _upsert_fab_swift_result(conn, result: Dict[str, Any]) -> int:
                  side, trade_date, settlement_date, effective_settlement_date,
                  face_amount, settled_amount, settled_currency, run_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (message_ref) DO UPDATE SET
-                email_id   = EXCLUDED.email_id,
-                run_id     = EXCLUDED.run_id
+            ON CONFLICT (email_id) DO UPDATE SET
+                source_file               = EXCLUDED.source_file,
+                message_ref               = EXCLUDED.message_ref,
+                mt_type                   = EXCLUDED.mt_type,
+                isin                      = EXCLUDED.isin,
+                security_name             = EXCLUDED.security_name,
+                side                      = EXCLUDED.side,
+                trade_date                = EXCLUDED.trade_date,
+                settlement_date           = EXCLUDED.settlement_date,
+                effective_settlement_date = EXCLUDED.effective_settlement_date,
+                face_amount               = EXCLUDED.face_amount,
+                settled_amount            = EXCLUDED.settled_amount,
+                settled_currency          = EXCLUDED.settled_currency,
+                run_id                    = EXCLUDED.run_id
             RETURNING id
         """, (
             result.get("email_id"),
@@ -3596,8 +3617,10 @@ def parse_fab_swift_pdf(
 
     side = "BUY" if mt_type == "MT545" else "SELL"
 
-    # Message reference: :20C::SEME ... 2026033002170749
-    message_ref = rx(r":20C::SEME\s+\S[^\n]*\s+(\S+)", text)
+    # Message reference: :20C::SEME//<number> (e.g. "//2026040200217623")
+    message_ref = rx(r":20C::SEME//(\S+)", text)
+    if not message_ref:
+        message_ref = rx(r":20C::SEME\s+//(\S+)", text)
 
     # Dates: e.g. ":98A::TRAD Trade Date/Time 2026-02-18"
     trade_date_raw = rx(r":98A::TRAD\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
