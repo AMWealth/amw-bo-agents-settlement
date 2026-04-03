@@ -3497,7 +3497,7 @@ def parse_pdf_file(
 # =============================================================================
 
 def _ensure_fab_swift_table(conn) -> None:
-    """Create fab_swift_results table if it does not exist yet."""
+    """Create fab_swift_results table if it does not exist yet, and add any new columns."""
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS back_office_auto.fab_swift_results (
@@ -3524,6 +3524,17 @@ def _ensure_fab_swift_table(conn) -> None:
                 created_at              TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             )
         """)
+        # Add new columns (idempotent)
+        for col_def in [
+            "ADD COLUMN IF NOT EXISTS amount_diff         NUMERIC(20,4)",
+            "ADD COLUMN IF NOT EXISTS face_amount_match   BOOLEAN",
+            "ADD COLUMN IF NOT EXISTS internal_nominal    NUMERIC(20,4)",
+            "ADD COLUMN IF NOT EXISTS internal_value_date DATE",
+            "ADD COLUMN IF NOT EXISTS linked_mt_type      TEXT",
+            "ADD COLUMN IF NOT EXISTS settled_by          TEXT",
+            "ADD COLUMN IF NOT EXISTS settled_at          TIMESTAMP WITH TIME ZONE",
+        ]:
+            cur.execute(f"ALTER TABLE back_office_auto.fab_swift_results {col_def}")
     conn.commit()
 
 
@@ -3620,10 +3631,10 @@ def parse_fab_swift_pdf(
     if m35:
         security_name = m35.group(2).strip() or None
 
-    # Face amount: ":36B::ESTT ... Face Amount 233000,"
+    # Face amount: ":36B::ESTT ... Face Amount 347000,"
     face_amount_raw = rx(r":36B::ESTT[^\n]*Face Amount\s+([\d,]+)", text)
     if face_amount_raw:
-        face_amount_raw = face_amount_raw.replace(",", "")
+        face_amount_raw = face_amount_raw.rstrip(",").replace(",", "")
     face_amount = parse_decimal(face_amount_raw)
 
     # Settled amount and currency: ":19A::ESTT Settled Amount USD 479643,20"
@@ -3631,6 +3642,8 @@ def parse_fab_swift_pdf(
     settled_amount_raw = rx(r":19A::ESTT[^\n]*Settled Amount\s+[A-Z]{3}\s+([\d,]+(?:\.\d+)?)", text)
     settled_amount = None
     if settled_amount_raw:
+        # Strip trailing comma (e.g. "670751,") before decimal detection
+        settled_amount_raw = settled_amount_raw.rstrip(",")
         # European decimal comma: "479643,20" → "479643.20"; thousand separator: "1,234,567" → remove commas
         if re.search(r",\d{1,2}$", settled_amount_raw):
             settled_amount = parse_decimal(settled_amount_raw.replace(",", "."))
@@ -3725,53 +3738,92 @@ def _process_fab_swift_message(
 
 
 def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Match recent fab_swift_results against tab_deals (status=INSTRUCTED=2)
-    by ISIN + settlement_date + side. Compare settled_amount vs internal amount."""
+    """Match fab_swift_results against tab_deals (status IN (2,6) = INSTRUCTED or FAILED)
+    by ISIN + side + settlement_date. Fallback: match without date if primary fails.
+    Compare settled_amount vs net_amount (tolerance ±5 USD) and face_amount vs nominal.
+    """
     _ensure_fab_swift_table(conn)
 
-    # Load FAB SWIFT records from last 10 days
+    # Load FAB SWIFT records from last 30 days (or with NULL settlement_date)
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
             SELECT id, message_ref, mt_type, isin, security_name, side,
                    trade_date, settlement_date, effective_settlement_date,
                    face_amount, settled_amount, settled_currency, email_id
             FROM back_office_auto.fab_swift_results
-            WHERE settlement_date >= CURRENT_DATE - INTERVAL '10 days'
-            ORDER BY settlement_date DESC, id DESC
+            WHERE settlement_date >= CURRENT_DATE - INTERVAL '30 days'
+               OR settlement_date IS NULL
+            ORDER BY settlement_date DESC NULLS LAST, id DESC
         """)
         swift_rows = [dict(r) for r in cur.fetchall()]
+
+    def _find_candidates(isin, action_val, sett_date=None):
+        """Query tab_deals; if sett_date given use date filter, else no date filter."""
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if sett_date:
+                cur.execute("""
+                    SELECT td.id, td.symbol, td.qty, td.nominal, td.transaction_value,
+                           td.action, td.status, td.settle_date_cash, td.value_date_cash,
+                           td.value_date_securities, td.settle_date_securities,
+                           td.currency_pay,
+                           td.transaction_value + (
+                               CASE WHEN td.action = 0 THEN -td.execution_cost
+                               ELSE td.execution_cost END
+                           ) AS net_amount,
+                           cp.name AS counterparty
+                    FROM back_office.tab_deals td
+                    LEFT JOIN back_office.tab_counterparty cp ON td.counterparty_id = cp.id
+                    WHERE td.symbol = %s
+                      AND td.action = %s
+                      AND td.status IN (2, 6)
+                      AND td.settle_type = 'external'
+                      AND td.reason = 0
+                      AND (
+                          td.settle_date_cash = %s
+                          OR td.value_date_cash = %s
+                          OR td.value_date_securities = %s
+                          OR td.settle_date_securities = %s
+                      )
+                    ORDER BY td.id DESC
+                    LIMIT 5
+                """, (isin, action_val, sett_date, sett_date, sett_date, sett_date))
+            else:
+                cur.execute("""
+                    SELECT td.id, td.symbol, td.qty, td.nominal, td.transaction_value,
+                           td.action, td.status, td.settle_date_cash, td.value_date_cash,
+                           td.value_date_securities, td.settle_date_securities,
+                           td.currency_pay,
+                           td.transaction_value + (
+                               CASE WHEN td.action = 0 THEN -td.execution_cost
+                               ELSE td.execution_cost END
+                           ) AS net_amount,
+                           cp.name AS counterparty
+                    FROM back_office.tab_deals td
+                    LEFT JOIN back_office.tab_counterparty cp ON td.counterparty_id = cp.id
+                    WHERE td.symbol = %s
+                      AND td.action = %s
+                      AND td.status IN (2, 6)
+                      AND td.settle_type = 'external'
+                      AND td.reason = 0
+                    ORDER BY td.id DESC
+                    LIMIT 5
+                """, (isin, action_val))
+            return [dict(r) for r in cur.fetchall()]
 
     results = []
     for sw in swift_rows:
         isin = (sw.get("isin") or "").upper().strip()
         side = (sw.get("side") or "").upper()
         sett_date = sw.get("settlement_date")
-
-        # Map side to action: BUY=0, SELL=1
         action_val = 0 if side == "BUY" else 1
 
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT td.id, td.symbol, td.qty, td.nominal, td.transaction_value,
-                       td.action, td.status, td.settle_date_cash, td.value_date_cash,
-                       td.currency_pay,
-                       td.transaction_value + (
-                           CASE WHEN td.action = 0 THEN -td.execution_cost
-                           ELSE td.execution_cost END
-                       ) AS net_amount,
-                       cp.name AS counterparty
-                FROM back_office.tab_deals td
-                LEFT JOIN back_office.tab_counterparty cp ON td.counterparty_id = cp.id
-                WHERE td.symbol = %s
-                  AND td.action = %s
-                  AND td.status = 2
-                  AND td.settle_type = 'external'
-                  AND td.reason = 0
-                  AND (td.settle_date_cash = %s OR td.value_date_cash = %s)
-                ORDER BY td.id DESC
-                LIMIT 5
-            """, (isin, action_val, sett_date, sett_date))
-            candidates = [dict(r) for r in cur.fetchall()]
+        # Primary: match with date
+        candidates = _find_candidates(isin, action_val, sett_date) if sett_date else []
+        date_matched = bool(candidates)
+
+        # Fallback: match without date
+        if not candidates:
+            candidates = _find_candidates(isin, action_val, sett_date=None)
 
         sw_amount = sw.get("settled_amount")
         sw_face = sw.get("face_amount")
@@ -3779,25 +3831,46 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
         if not candidates:
             row = dict(sw)
             row["match_status"] = "NOT_FOUND"
-            row["match_note"] = "No INSTRUCTED deal found for ISIN+date+side"
+            row["match_note"] = "No INSTRUCTED/FAILED deal found for ISIN+side"
             row["internal_deal_id"] = None
             row["internal_amount"] = None
             row["internal_face_amount"] = None
+            row["amount_diff"] = None
+            row["face_amount_match"] = None
             row["counterparty"] = None
         else:
             best = candidates[0]
             int_amount = best.get("net_amount") or best.get("transaction_value")
             int_face = best.get("nominal") or best.get("qty")
+            int_value_date = best.get("settle_date_cash") or best.get("value_date_cash")
 
+            # Amount difference
+            amount_diff = None
+            if sw_amount is not None and int_amount is not None:
+                try:
+                    amount_diff = round(float(sw_amount) - float(int_amount), 4)
+                except Exception:
+                    pass
+
+            # Amount match: tolerance ±5 USD
             amount_ok = (sw_amount is not None and int_amount is not None
-                         and values_equal_decimal(sw_amount, int_amount, Decimal("1")))
+                         and values_equal_decimal(sw_amount, int_amount, Decimal("5")))
 
-            if amount_ok:
+            # Face amount match: exact (tolerance 0.0001)
+            face_ok = (sw_face is not None and int_face is not None
+                       and values_equal_decimal(sw_face, int_face, Decimal("0.0001")))
+
+            if not date_matched:
+                match_status = "DATE_MISMATCH"
+                diff_str = f" Δ={amount_diff:+.2f}" if amount_diff is not None else ""
+                match_note = f"Fallback match (date {sett_date} not found); settled={sw_amount} vs internal={int_amount}{diff_str}"
+            elif amount_ok:
                 match_status = "MATCHED"
-                match_note = None
+                match_note = None if face_ok else f"face_amount mismatch: pdf={sw_face} vs system={int_face}"
             else:
                 match_status = "AMOUNT_MISMATCH"
-                match_note = f"settled={sw_amount} vs internal={int_amount}"
+                diff_str = f" Δ={amount_diff:+.2f}" if amount_diff is not None else ""
+                match_note = f"settled={sw_amount} vs internal={int_amount}{diff_str}"
 
             row = dict(sw)
             row["match_status"] = match_status
@@ -3805,7 +3878,10 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
             row["internal_deal_id"] = best.get("id")
             row["internal_amount"] = int_amount
             row["internal_face_amount"] = int_face
+            row["amount_diff"] = amount_diff
+            row["face_amount_match"] = face_ok
             row["counterparty"] = best.get("counterparty")
+            row["internal_value_date"] = int_value_date
 
             # Update match result in DB
             with conn.cursor() as cur:
@@ -3813,10 +3889,14 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                     UPDATE back_office_auto.fab_swift_results
                     SET match_status = %s, match_note = %s,
                         internal_deal_id = %s, internal_amount = %s,
-                        internal_face_amount = %s, run_id = %s
+                        internal_face_amount = %s, run_id = %s,
+                        amount_diff = %s, face_amount_match = %s,
+                        internal_nominal = %s, internal_value_date = %s
                     WHERE id = %s
                 """, (match_status, match_note, best.get("id"),
-                      int_amount, int_face, run_id, sw["id"]))
+                      int_amount, int_face, run_id,
+                      amount_diff, face_ok, int_face, int_value_date,
+                      sw["id"]))
             conn.commit()
 
         results.append(row)
@@ -5984,6 +6064,56 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
     for col_idx, _ in enumerate(hdr3, 1):
         ws3.column_dimensions[get_column_letter(col_idx)].width = 18
 
+    # ── Sheet 4: FAB SWIFT MT545/MT547 ────────────────────────────────────────
+    fab_swift_rows = result.get("fab_swift_rows", [])
+    if fab_swift_rows:
+        ws4 = wb.create_sheet("FAB SWIFT MT545-MT547")
+        hdr4 = [
+            "MT Type", "ISIN", "Side", "Settlement Date", "Eff. Sett. Date",
+            "Face Amt (PDF)", "Face Amt (System)", "Settled Amt (PDF)", "Net Amt (System)",
+            "Δ Amount", "Status", "Internal Deal ID", "Note",
+        ]
+        ws4.append(hdr4)
+        for col_idx, _ in enumerate(hdr4, 1):
+            cell = ws4.cell(1, col_idx)
+            cell.fill = PatternFill("solid", fgColor="1F4E79")
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center")
+
+        STATUS_COLOR_SWIFT = {
+            "MATCHED":        "E2EFDA",
+            "AMOUNT_MISMATCH":"FCE4D6",
+            "DATE_MISMATCH":  "FFF2CC",
+            "NOT_FOUND":      "FFC7CE",
+        }
+        for sw in fab_swift_rows:
+            st = sw.get("match_status") or "NOT_FOUND"
+            color = STATUS_COLOR_SWIFT.get(st, "FFFFFF")
+            amount_diff = sw.get("amount_diff")
+            diff_val = round(float(amount_diff), 2) if amount_diff is not None else ""
+            data4 = [
+                sw.get("mt_type") or "",
+                sw.get("isin") or "",
+                sw.get("side") or "",
+                _fmt_date(sw.get("settlement_date")),
+                _fmt_date(sw.get("effective_settlement_date")),
+                _fmt_num(sw.get("face_amount")),
+                _fmt_num(sw.get("internal_face_amount")),
+                _fmt_amount(sw.get("settled_amount")),
+                _fmt_amount(sw.get("internal_amount")),
+                diff_val,
+                st,
+                sw.get("internal_deal_id") or "",
+                sw.get("match_note") or "",
+            ]
+            ws4.append(data4)
+            fill4 = PatternFill("solid", fgColor=color)
+            for col_idx in range(1, len(data4) + 1):
+                ws4.cell(ws4.max_row, col_idx).fill = fill4
+
+        for col_idx, _ in enumerate(hdr4, 1):
+            ws4.column_dimensions[get_column_letter(col_idx)].width = 18
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -6183,9 +6313,11 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         html += """<div class="sect">D. FAB SWIFT Settlement Confirmations (MT545/MT547)</div>
 <table>
 <tr>
-  <th>MT Type</th><th>ISIN</th><th>Side</th><th>Settlement Date</th>
-  <th>Face Amount</th><th>Settled Amount (CCY)</th>
-  <th>Internal Deal</th><th>Internal Amount</th><th>Status</th><th>Note</th>
+  <th>MT Type</th><th>ISIN</th><th>Side</th>
+  <th>Settlement Date</th><th>Eff. Sett. Date</th>
+  <th>Face Amt (PDF)</th><th>Face Amt (System)</th>
+  <th>Settled Amt (PDF)</th><th>Net Amt (System)</th><th>Δ Amount</th>
+  <th>Status</th><th>Internal Deal</th><th>Note</th>
 </tr>
 """
         for sw in fab_swift_rows:
@@ -6194,19 +6326,27 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
                 color = "#E2EFDA"
             elif status == "AMOUNT_MISMATCH":
                 color = "#FCE4D6"
-            else:
+            elif status == "DATE_MISMATCH":
                 color = "#FFF2CC"
+            else:
+                color = "#FFC7CE"
             ccy = sw.get("settled_currency") or ""
+            amount_diff = sw.get("amount_diff")
+            diff_str = f"{float(amount_diff):+,.2f}" if amount_diff is not None else ""
+            diff_color = ' style="color:green"' if (amount_diff is not None and abs(float(amount_diff)) < 5) else (' style="color:red;font-weight:bold"' if amount_diff is not None else "")
             html += f'<tr style="background:{color}">'
             html += f"<td><b>{sw.get('mt_type') or ''}</b></td>"
             html += f"<td>{sw.get('isin') or ''}</td>"
             html += f"<td>{sw.get('side') or ''}</td>"
             html += f"<td>{_fmt_date(sw.get('settlement_date'))}</td>"
+            html += f"<td>{_fmt_date(sw.get('effective_settlement_date'))}</td>"
             html += f"<td>{_fmt_num(sw.get('face_amount'))}</td>"
+            html += f"<td>{_fmt_num(sw.get('internal_face_amount'))}</td>"
             html += f"<td>{_fmt_amount(sw.get('settled_amount'))} {ccy}</td>"
-            html += f"<td>{sw.get('internal_deal_id') or '—'}</td>"
             html += f"<td>{_fmt_amount(sw.get('internal_amount'))}</td>"
-            html += f"<td>{status}</td>"
+            html += f"<td{diff_color}>{diff_str}</td>"
+            html += f"<td><b>{status}</b></td>"
+            html += f"<td>{sw.get('internal_deal_id') or '—'}</td>"
             html += f"<td>{sw.get('match_note') or ''}</td>"
             html += "</tr>\n"
         html += "</table>\n"
