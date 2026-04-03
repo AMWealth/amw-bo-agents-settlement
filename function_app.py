@@ -6353,7 +6353,11 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         html += "</table>\n"
 
     # ── Table D: FAB SWIFT MT545/MT547 Settlement Confirmations ──────────────
-    fab_swift_rows = result.get("fab_swift_rows", [])
+    # Only show non-settled rows (exclude MATCHED — no action needed)
+    fab_swift_rows = [
+        r for r in result.get("fab_swift_rows", [])
+        if r.get("match_status") != "MATCHED"
+    ]
     if fab_swift_rows:
         html += """<div class="sect">D. FAB SWIFT Settlement Confirmations (MT545/MT547)</div>
 <table>
