@@ -3451,6 +3451,7 @@ def parse_pdf_file(
     file_id: Optional[int],
     email_id: Optional[int],
     mapping_by_sender: Dict[str, Dict[str, Any]],
+    sender_name: str = "",
 ) -> List[Dict[str, Any]]:
     text = extract_pdf_text(file_bytes)
     template_code = detect_template_from_mapping(sender, mapping_by_sender)
@@ -3490,16 +3491,17 @@ def parse_pdf_file(
         return parse_instinet_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
     if template_code == "ENBD_PDF":
-        # ENBD Securities "Order Confirmation Report" (equity, SincyJO@emiratesnbd.com)
-        # uses a different format from the bond confirmation — detect by PDF content
+        # ENBD Securities "Order Confirmation Report" (equity, GCM senders @emiratesnbd.com)
+        # Only route to securities parser if sender display name contains "GCM"
         has_order_report = "Order Confirmation Report" in text
         has_sell_confo = "Sell Confirmation" in text
         has_buy_confo = "Buy Confirmation" in text
+        is_gcm = "gcm" in sender_name.lower()
         logging.warning(
-            "ENBD_ROUTING sender=%s file=%s order_report=%s sell_confo=%s buy_confo=%s",
-            sender, filename, has_order_report, has_sell_confo, has_buy_confo,
+            "ENBD_ROUTING sender=%s sender_name=%r file=%s order_report=%s sell_confo=%s buy_confo=%s gcm=%s",
+            sender, sender_name, filename, has_order_report, has_sell_confo, has_buy_confo, is_gcm,
         )
-        if has_order_report or has_sell_confo or has_buy_confo:
+        if is_gcm and (has_order_report or has_sell_confo or has_buy_confo):
             return parse_enbd_securities_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
         return parse_enbd_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
@@ -3956,6 +3958,7 @@ def parse_single_attachment(
     attachment_order: Optional[int] = None,
     parent_zip_file_name: Optional[str] = None,
     mapping_by_sender: Optional[Dict[str, Dict[str, Any]]] = None,
+    sender_name: str = "",
 ) -> int:
     parsed_count = 0
     seen_keys = set()
@@ -4046,6 +4049,7 @@ def parse_single_attachment(
             filename=filename,
             internet_message_id=internet_message_id,
             sender=sender,
+            sender_name=sender_name,
             email_received_at=email_received_at,
             processing_run_id=processing_run_id,
             file_id=file_id,
@@ -4083,6 +4087,7 @@ def parse_single_attachment(
                         conn=conn,
                         internet_message_id=internet_message_id,
                         sender=sender,
+                        sender_name=sender_name,
                         filename=normalized_inner_name,
                         file_bytes=inner_bytes,
                         email_received_at=email_received_at,
@@ -4855,6 +4860,7 @@ def process_message(
     subject = clean_text(msg.get("subject"))
     received_at_raw = msg.get("receivedDateTime")
     sender = normalize_email_address(msg.get("from", {}))
+    sender_name = ((msg.get("from") or {}).get("emailAddress") or {}).get("name") or ""
 
     if isinstance(received_at_raw, str):
         try:
@@ -4987,6 +4993,7 @@ def process_message(
             conn=conn,
             internet_message_id=internet_message_id,
             sender=sender,
+            sender_name=sender_name,
             filename=filename,
             file_bytes=file_bytes,
             email_received_at=received_at,
