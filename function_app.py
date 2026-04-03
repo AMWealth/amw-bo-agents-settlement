@@ -3775,7 +3775,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                     LEFT JOIN back_office.tab_counterparty cp ON td.counterparty_id = cp.id
                     WHERE td.symbol = %s
                       AND td.action = %s
-                      AND td.status IN (2, 6)
+                      AND td.status IN (2, 4, 6)
                       AND td.settle_type = 'external'
                       AND td.reason = 0
                       AND (
@@ -3802,7 +3802,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                     LEFT JOIN back_office.tab_counterparty cp ON td.counterparty_id = cp.id
                     WHERE td.symbol = %s
                       AND td.action = %s
-                      AND td.status IN (2, 6)
+                      AND td.status IN (2, 4, 6)
                       AND td.settle_type = 'external'
                       AND td.reason = 0
                     ORDER BY td.id DESC
