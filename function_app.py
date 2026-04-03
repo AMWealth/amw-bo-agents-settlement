@@ -3852,9 +3852,9 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                 except Exception:
                     pass
 
-            # Amount match: tolerance ±5 USD
+            # Amount match: tolerance ±1 USD
             amount_ok = (sw_amount is not None and int_amount is not None
-                         and values_equal_decimal(sw_amount, int_amount, Decimal("5")))
+                         and values_equal_decimal(sw_amount, int_amount, Decimal("1")))
 
             # Face amount match: exact (tolerance 0.0001)
             face_ok = (sw_face is not None and int_face is not None
