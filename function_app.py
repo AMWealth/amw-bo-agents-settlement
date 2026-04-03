@@ -3496,7 +3496,8 @@ def parse_pdf_file(
         has_order_report = "Order Confirmation Report" in text
         has_sell_confo = "Sell Confirmation" in text
         has_buy_confo = "Buy Confirmation" in text
-        is_gcm = "gcm" in sender_name.lower()
+        # GCM filter: block only if sender name is explicitly non-GCM; unknown/empty = allow
+        is_gcm = (not sender_name) or ("gcm" in sender_name.lower())
         logging.warning(
             "ENBD_ROUTING sender=%s sender_name=%r file=%s order_report=%s sell_confo=%s buy_confo=%s gcm=%s",
             sender, sender_name, filename, has_order_report, has_sell_confo, has_buy_confo, is_gcm,
