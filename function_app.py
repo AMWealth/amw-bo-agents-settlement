@@ -47,6 +47,8 @@ GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 REPORT_TO = os.environ.get("SETTLEMENT_REPORT_TO", "k.malkova@amwealth.ae").strip()
+TEST_MODE = os.environ.get("TEST_MODE", "false").strip().lower() in ("1", "true", "yes")
+TEST_EMAIL = "k.malkova@amwealth.ae"
 
 # Optional fallback only
 ALLOWED_SENDERS_FALLBACK = {
@@ -6432,10 +6434,14 @@ def send_reconciliation_email(token: str, result: dict, date_from, date_to) -> N
         "message": {
             "subject": subject,
             "body": {"contentType": "HTML", "content": html_body},
-            "toRecipients": [
-                {"emailAddress": {"address": REPORT_TO}},
-                {"emailAddress": {"address": "Back.office@amwealth.ae"}},
-            ],
+            "toRecipients": (
+                [{"emailAddress": {"address": TEST_EMAIL}}]
+                if TEST_MODE
+                else [
+                    {"emailAddress": {"address": REPORT_TO}},
+                    {"emailAddress": {"address": "Back.office@amwealth.ae"}},
+                ]
+            ),
             "attachments": [
                 {
                     "@odata.type": "#microsoft.graph.fileAttachment",
