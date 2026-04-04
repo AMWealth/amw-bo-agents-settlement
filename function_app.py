@@ -3820,6 +3820,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                       AND td.status IN (2, 4, 6)
                       AND td.settle_type = 'external'
                       AND td.reason = 0
+                      AND td.login = 1
                       AND (
                           td.settle_date_cash = %s
                           OR td.value_date_cash = %s
@@ -3847,6 +3848,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                       AND td.status IN (2, 4, 6)
                       AND td.settle_type = 'external'
                       AND td.reason = 0
+                      AND td.login = 1
                     ORDER BY td.id DESC
                     LIMIT 5
                 """, (isin, action_val))
