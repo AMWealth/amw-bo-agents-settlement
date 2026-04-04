@@ -7158,8 +7158,19 @@ def run_reconciliation_http(req: func.HttpRequest) -> func.HttpResponse:
             token = get_graph_token()
             send_reconciliation_email(token, result, confo_from, t0_date)
         return func.HttpResponse(
-            json.dumps({"ok": True, "comparison_rows": result["comparison_rows"],
-                        "matched": result["matched_count"], "run_id": run_id}),
+            json.dumps({
+                "ok": True,
+                "comparison_rows": result["comparison_rows"],
+                "matched": result["matched_count"],
+                "matched_aggregated_count": result.get("matched_aggregated_count", 0),
+                "partial_count": result.get("partial_count", 0),
+                "run_id": run_id,
+                # Full data for web display (mirrors what is sent in the email)
+                "detail_rows": result.get("detail_rows", []),
+                "unmatched_internal": result.get("unmatched_internal", []),
+                "unconfirmed_deals": result.get("unconfirmed_deals", []),
+                "fab_swift_rows": result.get("fab_swift_rows", []),
+            }, default=str),
             mimetype="application/json", status_code=200,
         )
     except Exception as ex:
