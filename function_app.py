@@ -3854,15 +3854,15 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                 """, (isin, action_val))
             return [dict(r) for r in cur.fetchall()]
 
-    # Pre-load set of ISINs that have at least one deal with login=1
-    # Used to skip NOT_FOUND rows where only CMF (login=5) deals exist
-    _fab_isins = set()
+    # Pre-load set of (ISIN, action) pairs that have at least one deal with login=1
+    # Used to skip NOT_FOUND rows where only CMF (login=5) deals exist for that side
+    _fab_isin_actions = set()
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT DISTINCT symbol FROM back_office.tab_deals
+            SELECT DISTINCT symbol, action FROM back_office.tab_deals
             WHERE login = 1 AND reason = 0 AND settle_type = 'external'
         """)
-        _fab_isins = {r[0] for r in cur.fetchall()}
+        _fab_isin_actions = {(r[0], r[1]) for r in cur.fetchall()}
 
     results = []
     for sw in swift_rows:
@@ -3883,8 +3883,8 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
         sw_face = sw.get("face_amount")
 
         if not candidates:
-            # Skip ISINs that have no FAB deals (login=1) — CMF-only
-            if isin not in _fab_isins:
+            # Skip ISIN+side combos that have no FAB deals (login=1) — CMF-only
+            if (isin, action_val) not in _fab_isin_actions:
                 continue
             row = dict(sw)
             row["match_status"] = "NOT_FOUND"
