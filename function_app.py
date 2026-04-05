@@ -6859,10 +6859,7 @@ def run_settlement_reconciliation(
         "detail_rows": detail_rows,
         "unmatched_internal": unmatched_internal,
         "unconfirmed_deals": unconfirmed_deals,
-        "fab_swift_rows": [
-            r for r in fab_swift_rows
-            if r.get("_deal_login") != 5
-        ],
+        "fab_swift_rows": fab_swift_rows,
     }
 
 
@@ -7147,12 +7144,11 @@ def run_reconciliation_http(req: func.HttpRequest) -> func.HttpResponse:
         conn = get_conn()
         run_id = start_agent_run(conn, "run_reconciliation_http")
         t0_date, _t1_date, _t_next_date = get_t0_t1_dates()
-        confo_from = n_prev_business_days(t0_date, 2)
-        deal_from  = n_prev_business_days(t0_date, 5)
+        confo_from = n_prev_business_days(t0_date, 10)
         result = run_settlement_reconciliation(
             conn, run_id=run_id,
             date_from=confo_from, date_to=t0_date,
-            deal_date_from=deal_from, deal_date_to=t0_date,
+            deal_date_from=None, deal_date_to=None,
         )
         finish_agent_run(conn, run_id, "SUCCESS",
             f"comparison_rows={result['comparison_rows']}, matched={result['matched_count']}")
@@ -7328,12 +7324,11 @@ def daily_reconciliation(timer: func.TimerRequest) -> None:
         conn = get_conn()
         run_id = start_agent_run(conn, "daily_reconciliation")
         t0_date, _t1_date, _t_next_date = get_t0_t1_dates()
-        confo_from = n_prev_business_days(t0_date, 2)
-        deal_from  = n_prev_business_days(t0_date, 5)
+        confo_from = n_prev_business_days(t0_date, 10)
         result = run_settlement_reconciliation(
             conn, run_id=run_id,
             date_from=confo_from, date_to=t0_date,
-            deal_date_from=deal_from, deal_date_to=t0_date,
+            deal_date_from=None, deal_date_to=None,
         )
         finish_agent_run(conn, run_id, "SUCCESS",
             f"comparison_rows={result['comparison_rows']}, matched={result['matched_count']}")
