@@ -3900,9 +3900,10 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
             amount_ok = (sw_amount is not None and int_amount is not None
                          and values_equal_decimal(sw_amount, int_amount, Decimal("1")))
 
-            # Face amount match: exact (tolerance 0.0001)
-            face_ok = (sw_face is not None and int_face is not None
-                       and values_equal_decimal(sw_face, int_face, Decimal("0.0001")))
+            # Face amount match: skip if PDF has no face amount (equities)
+            face_ok = (sw_face is None  # no face in PDF — skip check
+                       or (int_face is not None
+                           and values_equal_decimal(sw_face, int_face, Decimal("0.0001"))))
 
             if not date_matched:
                 match_status = "DATE_MISMATCH"
@@ -5665,8 +5666,8 @@ def exact_score(st: Dict[str, Any], td: Dict[str, Any]) -> Tuple[int, List[str]]
         else:
             notes.append("price_mismatch")
 
-    ext_amount = st.get("net_amount") if st.get("net_amount") is not None else st.get("consideration")
-    int_amount = td.get("net_amount") if td.get("net_amount") else td.get("transaction_value")
+    ext_amount = st.get("consideration") if st.get("consideration") is not None else st.get("net_amount")
+    int_amount = td.get("transaction_value") if td.get("transaction_value") else td.get("net_amount")
     if ext_amount is not None and int_amount is not None:
         if values_equal_decimal(ext_amount, int_amount, Decimal("0.5")):
             score += 20
