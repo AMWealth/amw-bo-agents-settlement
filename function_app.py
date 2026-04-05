@@ -3805,7 +3805,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
             if sett_date:
                 cur.execute("""
                     SELECT td.id, td.symbol, td.qty, td.nominal, td.transaction_value,
-                           td.action, td.status, td.settle_date_cash, td.value_date_cash,
+                           td.action, td.status, td.login, td.settle_date_cash, td.value_date_cash,
                            td.value_date_securities, td.settle_date_securities,
                            td.currency_pay,
                            td.transaction_value + (
@@ -3833,7 +3833,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
             else:
                 cur.execute("""
                     SELECT td.id, td.symbol, td.qty, td.nominal, td.transaction_value,
-                           td.action, td.status, td.settle_date_cash, td.value_date_cash,
+                           td.action, td.status, td.login, td.settle_date_cash, td.value_date_cash,
                            td.value_date_securities, td.settle_date_securities,
                            td.currency_pay,
                            td.transaction_value + (
@@ -3927,6 +3927,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
             row["face_amount_match"] = face_ok
             row["counterparty"] = best.get("counterparty")
             row["internal_value_date"] = int_value_date
+            row["_deal_login"] = best.get("login")
 
             # Update match result in DB
             with conn.cursor() as cur:
@@ -6119,9 +6120,9 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
     if fab_swift_rows:
         ws4 = wb.create_sheet("FAB SWIFT MT545-MT547")
         hdr4 = [
-            "MT Type", "ISIN", "Side", "Settlement Date", "Eff. Sett. Date",
-            "Face Amt (PDF)", "Face Amt (System)", "Settled Amt (PDF)", "Net Amt (System)",
-            "Δ Amount", "Status", "Internal Deal ID", "Note",
+            "ISIN", "Side", "Match", "Internal Deal",
+            "MT", "Sett. Date", "Eff. Sett. (PDF)",
+            "Settled Amt", "Net Amt (Sys)", "Δ Amount", "Note",
         ]
         ws4.append(hdr4)
         for col_idx, _ in enumerate(hdr4, 1):
@@ -6142,18 +6143,16 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
             amount_diff = sw.get("amount_diff")
             diff_val = round(float(amount_diff), 2) if amount_diff is not None else ""
             data4 = [
-                sw.get("mt_type") or "",
                 sw.get("isin") or "",
                 sw.get("side") or "",
+                st,
+                sw.get("internal_deal_id") or "",
+                sw.get("mt_type") or "",
                 _fmt_date(sw.get("settlement_date")),
                 _fmt_date(sw.get("effective_settlement_date")),
-                _fmt_num(sw.get("face_amount")),
-                _fmt_num(sw.get("internal_face_amount")),
                 _fmt_amount(sw.get("settled_amount")),
                 _fmt_amount(sw.get("internal_amount")),
                 diff_val,
-                st,
-                sw.get("internal_deal_id") or "",
                 sw.get("match_note") or "",
             ]
             ws4.append(data4)
@@ -6358,20 +6357,15 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         html += "</table>\n"
 
     # ── Table D: FAB SWIFT MT545/MT547 Settlement Confirmations ──────────────
-    # Only show non-settled rows (exclude MATCHED — no action needed)
-    fab_swift_rows = [
-        r for r in result.get("fab_swift_rows", [])
-        if r.get("match_status") != "MATCHED"
-    ]
+    fab_swift_rows = result.get("fab_swift_rows", [])
     if fab_swift_rows:
-        html += """<div class="sect">D. FAB SWIFT Settlement Confirmations (MT545/MT547)</div>
+        html += f"""<div class="sect">D. FAB SWIFT Settlement Confirmations — MT545/MT547 ({len(fab_swift_rows)})</div>
 <table>
 <tr>
-  <th>MT Type</th><th>ISIN</th><th>Side</th>
-  <th>Settlement Date</th><th>Eff. Sett. Date</th>
-  <th>Face Amt (PDF)</th><th>Face Amt (System)</th>
-  <th>Settled Amt (PDF)</th><th>Net Amt (System)</th><th>Δ Amount</th>
-  <th>Status</th><th>Internal Deal</th><th>Note</th>
+  <th>ISIN</th><th>Side</th><th>Match</th><th>Internal Deal</th>
+  <th>MT</th><th>Sett. Date</th><th>Eff. Sett. (PDF)</th>
+  <th>Settled Amt</th><th>Net Amt (Sys)</th><th>Δ Amount</th>
+  <th>Note</th>
 </tr>
 """
         for sw in fab_swift_rows:
@@ -6389,18 +6383,16 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
             diff_str = f"{float(amount_diff):+,.2f}" if amount_diff is not None else ""
             diff_color = ' style="color:green"' if (amount_diff is not None and abs(float(amount_diff)) < 5) else (' style="color:red;font-weight:bold"' if amount_diff is not None else "")
             html += f'<tr style="background:{color}">'
-            html += f"<td><b>{sw.get('mt_type') or ''}</b></td>"
             html += f"<td>{sw.get('isin') or ''}</td>"
             html += f"<td>{sw.get('side') or ''}</td>"
+            html += f"<td><b>{status}</b></td>"
+            html += f"<td>{sw.get('internal_deal_id') or '—'}</td>"
+            html += f"<td>{sw.get('mt_type') or ''}</td>"
             html += f"<td>{_fmt_date(sw.get('settlement_date'))}</td>"
             html += f"<td>{_fmt_date(sw.get('effective_settlement_date'))}</td>"
-            html += f"<td>{_fmt_num(sw.get('face_amount'))}</td>"
-            html += f"<td>{_fmt_num(sw.get('internal_face_amount'))}</td>"
             html += f"<td>{_fmt_amount(sw.get('settled_amount'))} {ccy}</td>"
             html += f"<td>{_fmt_amount(sw.get('internal_amount'))}</td>"
             html += f"<td{diff_color}>{diff_str}</td>"
-            html += f"<td><b>{status}</b></td>"
-            html += f"<td>{sw.get('internal_deal_id') or '—'}</td>"
             html += f"<td>{sw.get('match_note') or ''}</td>"
             html += "</tr>\n"
         html += "</table>\n"
@@ -6867,7 +6859,10 @@ def run_settlement_reconciliation(
         "detail_rows": detail_rows,
         "unmatched_internal": unmatched_internal,
         "unconfirmed_deals": unconfirmed_deals,
-        "fab_swift_rows": fab_swift_rows,
+        "fab_swift_rows": [
+            r for r in fab_swift_rows
+            if r.get("_deal_login") != 5
+        ],
     }
 
 
