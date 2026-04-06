@@ -6207,8 +6207,13 @@ def compute_gl_account(symbol: str) -> str:
 
 def build_reconciliation_html(result: dict, date_from, date_to) -> str:
     """Build HTML email body for reconciliation report."""
-    matched = result.get("matched_count", 0) + result.get("matched_aggregated_count", 0)
-    partial = result.get("partial_count", 0)
+    # Count only non-instructed rows for summary
+    _active_rows = [
+        r for r in result.get("detail_rows", [])
+        if not r.get("instructed")
+    ]
+    matched = sum(1 for r in _active_rows if r.get("status") in ("MATCHED", "MATCHED_AGGREGATED"))
+    partial = sum(1 for r in _active_rows if r.get("status") == "PARTIAL")
     no_confo = len(result.get("unmatched_internal", []))
     unconfirmed_count = len(result.get("unconfirmed_deals", []))
 
@@ -6268,8 +6273,8 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
   <div class="badge" style="background:#DAEEF3; color:#1F497D;">🔔 Unconfirmed<br><span style="font-size:22px">{unconfirmed_count}</span></div>
 </div>
 <div style="font-size:12px; color:#555; margin-bottom:16px;">
-  Exact match: {result.get('matched_count',0)} &nbsp;|&nbsp;
-  Netting: {result.get('matched_aggregated_count',0)} &nbsp;|&nbsp;
+  Exact match: {sum(1 for r in _active_rows if r.get('status') == 'MATCHED')} &nbsp;|&nbsp;
+  Netting: {sum(1 for r in _active_rows if r.get('status') == 'MATCHED_AGGREGATED')} &nbsp;|&nbsp;
   Partial (mismatch): {partial} &nbsp;|&nbsp;
   Internal no confo: {no_confo} &nbsp;|&nbsp;
   Unconfirmed (FX): {unconfirmed_count}
@@ -6431,8 +6436,10 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
 
 def send_reconciliation_email(token: str, result: dict, date_from, date_to) -> None:
     """Send reconciliation report email with Excel attachment via Graph API."""
-    matched = result.get("matched_count", 0) + result.get("matched_aggregated_count", 0)
-    partial = result.get("partial_count", 0)
+    # Count only non-instructed rows for subject line
+    _active = [r for r in result.get("detail_rows", []) if not r.get("instructed")]
+    matched = sum(1 for r in _active if r.get("status") in ("MATCHED", "MATCHED_AGGREGATED"))
+    partial = sum(1 for r in _active if r.get("status") == "PARTIAL")
     no_confo = len(result.get("unmatched_internal", []))
     unconfirmed_count = len(result.get("unconfirmed_deals", []))
 
