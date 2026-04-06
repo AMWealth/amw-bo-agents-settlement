@@ -6281,6 +6281,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         r for r in result.get("detail_rows", [])
         if r.get("status") in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING")
         and r.get("validation_status") != "FAILED"
+        and not r.get("instructed")
     ]
     html += f"""<div class="sect">A. Confo vs Internal — {len(_table_a_rows)} trades to process</div>
 <table>
