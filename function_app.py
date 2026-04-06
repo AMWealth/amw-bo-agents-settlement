@@ -3789,13 +3789,16 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
     # Load FAB SWIFT records from last 30 days (or with NULL settlement_date)
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("""
-            SELECT id, message_ref, mt_type, isin, security_name, side,
-                   trade_date, settlement_date, effective_settlement_date,
-                   face_amount, settled_amount, settled_currency, email_id
-            FROM back_office_auto.fab_swift_results
-            WHERE settlement_date >= CURRENT_DATE - INTERVAL '30 days'
-               OR settlement_date IS NULL
-            ORDER BY settlement_date DESC NULLS LAST, id DESC
+            SELECT f.id, f.message_ref, f.mt_type, f.isin, f.security_name, f.side,
+                   f.trade_date, f.settlement_date, f.effective_settlement_date,
+                   f.face_amount, f.settled_amount, f.settled_currency, f.email_id
+            FROM back_office_auto.fab_swift_results f
+            LEFT JOIN back_office.tab_deals d ON d.id = f.internal_deal_id
+            WHERE f.settled_at IS NULL
+              AND (f.settlement_date >= CURRENT_DATE - INTERVAL '30 days'
+                   OR f.settlement_date IS NULL)
+              AND (d.status IS NULL OR d.status NOT IN (4, 7))
+            ORDER BY f.settlement_date DESC NULLS LAST, f.id DESC
         """)
         swift_rows = [dict(r) for r in cur.fetchall()]
 
