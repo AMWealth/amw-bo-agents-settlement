@@ -3661,11 +3661,16 @@ def parse_fab_swift_pdf(
     _isin_pat = re.compile(r"\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b\s*\n\s*:35B:")
     _m = _isin_pat.search(text)
     isin = _m.group(1) if _m else None
-    # Fallback: ISIN anywhere before :35B: within 3 lines
+    # Fallback 1: ISIN anywhere before :35B: within 3 lines
     if not isin:
         _isin_pat2 = re.compile(r"\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b(?:[^\n]*\n){0,3}[^\n]*:35B:")
         _m2 = _isin_pat2.search(text)
         isin = _m2.group(1) if _m2 else None
+    # Fallback 2: ISIN on the same line AFTER :35B: (some PDFs put it there)
+    if not isin:
+        _isin_pat3 = re.compile(r":35B:[^\n]*\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b")
+        _m3 = _isin_pat3.search(text)
+        isin = _m3.group(1) if _m3 else None
 
     # Security name: on the line(s) after ":35B: Identification..." (skip /TS/BBG... lines)
     security_name = None
@@ -3673,8 +3678,13 @@ def parse_fab_swift_pdf(
     if m35:
         security_name = m35.group(2).strip() or None
 
-    # Face amount: ":36B::ESTT ... Face Amount 347000,"
+    # Face amount / Quantity: ":36B::ESTT ... Face Amount 347000," or "Unit Number 3268,"
     face_amount_raw = rx(r":36B::ESTT[^\n]*Face Amount\s+([\d,]+)", text)
+    if not face_amount_raw:
+        face_amount_raw = rx(r":36B::ESTT[^\n]*(?:Unit Number|Quantity)[^\d]*([\d,]+)", text)
+    if not face_amount_raw:
+        # Generic fallback: any number after :36B::ESTT
+        face_amount_raw = rx(r":36B::ESTT[^\n]*([\d][\d,]*)", text)
     if face_amount_raw:
         face_amount_raw = face_amount_raw.rstrip(",").replace(",", "")
     face_amount = parse_decimal(face_amount_raw)
