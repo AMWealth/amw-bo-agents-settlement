@@ -4933,6 +4933,12 @@ def process_message(
                 internet_message_id=internet_message_id, subject=subject,
                 received_at=received_at, processing_run_id=processing_run_id,
             )
+        if "MT566" in subj_upper:
+            return _process_mt566_message(
+                conn=conn, token=token, mailbox=mailbox, msg=msg,
+                internet_message_id=internet_message_id, subject=subject,
+                received_at=received_at, processing_run_id=processing_run_id,
+            )
         return ("SKIPPED", 0)
 
     if sender == "bo.tdsm@zarattinibank.ch" and "confirmation" not in subject.lower():
@@ -7383,3 +7389,259 @@ def daily_reconciliation(timer: func.TimerRequest) -> None:
     finally:
         if conn:
             conn.close()
+
+
+# =============================================================================
+# FAB MT566 CORPORATE ACTIONS PARSER
+# =============================================================================
+
+def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
+    """Parse FAB MT566 corporate action PDF.
+    Supported action_types: DIVIDEND, COUPON, PARTIAL_REDEMPTION, FULL_REDEMPTION
+    """
+    text_upper = text.upper()
+
+    # Detect action type by PDF content
+    action_type = None
+    if re.search(r"FULL\s+REDEMPTION|CALL\s+REDEMPTION", text_upper):
+        action_type = "FULL_REDEMPTION"
+    elif re.search(r"PARTIAL\s+REDEMPTION", text_upper):
+        action_type = "PARTIAL_REDEMPTION"
+    elif re.search(r"INTEREST\s+PAYMENT|COUPON", text_upper):
+        action_type = "COUPON"
+    elif re.search(r"CASH\s+DIVIDEND|DIVIDEND", text_upper):
+        action_type = "DIVIDEND"
+
+    if not action_type:
+        logging.warning("MT566_PARSER: cannot detect action_type in %s", filename)
+        return None
+
+    # SEME — dedup key
+    seme = rx(r":20C::SEME//(\S+)", text)
+
+    # ISIN: :35B::ISIN//XS1234567890
+    isin = rx(r":35B::ISIN//([A-Z]{2}[A-Z0-9]{10})", text)
+    if not isin:
+        isin = rx(r":35B:[^\n]*\bISIN\b[^\n]*\b([A-Z]{2}[A-Z0-9]{10})\b", text)
+
+    # Cash amount: :19B::ENTL// (entitlement) or :19B::GRSS// (gross)
+    # Format: :19B::ENTL//USD12345,67  or  :19B::ENTL// USD 12345,67
+    def _parse_19b(tag: str) -> Tuple[Optional[str], Optional[Decimal]]:
+        m = re.search(rf":19B::{tag}//([A-Z]{{3}})([\d,\.]+)", text, re.IGNORECASE)
+        if not m:
+            m = re.search(rf":19B::{tag}\b[^\n]*?([A-Z]{{3}})\s+([\d,\.]+)", text, re.IGNORECASE)
+        if m:
+            ccy = m.group(1).upper()
+            raw = m.group(2).rstrip(",").replace(",", ".")
+            # If multiple dots, European format: only last one is decimal separator
+            parts = raw.split(".")
+            if len(parts) > 2:
+                raw = "".join(parts[:-1]) + "." + parts[-1]
+            return ccy, parse_decimal(raw)
+        return None, None
+
+    currency, cash_amount = _parse_19b("ENTL")
+    if cash_amount is None:
+        currency, cash_amount = _parse_19b("GRSS")
+
+    _, tax_amount = _parse_19b("WITL")
+    _, charges_amount = _parse_19b("CHAR")
+
+    # Nominal / face amount: :36B::PSTA//FAMT/12345,
+    nominal_raw = rx(r":36B::PSTA//\w+/([\d,\.]+)", text)
+    if not nominal_raw:
+        nominal_raw = rx(r":36B::PSTA\b[^\n]*([\d,\.]+)", text)
+    nominal = None
+    if nominal_raw:
+        nominal_raw = nominal_raw.rstrip(",").replace(",", "")
+        nominal = parse_decimal(nominal_raw)
+
+    # Payment date: :98A::PAYD// or :98A::VALU//
+    # Format: :98A::PAYD//20260407  (YYYYMMDD compact)
+    def _parse_98a(tag: str) -> Optional[date]:
+        raw = rx(rf":98A::{tag}//(\d{{8}})", text)
+        if not raw:
+            raw = rx(rf":98A::{tag}\b[^\n]*?(\d{{4}}-\d{{2}}-\d{{2}})", text)
+        if not raw:
+            raw = rx(rf":98A::{tag}\b[^\n]*?(\d{{2}}\.\d{{2}}\.\d{{4}})", text)
+        if raw and re.match(r"^\d{8}$", raw):
+            raw = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+        return parse_date_any(raw, prefer_day_first=False) if raw else None
+
+    payment_date = _parse_98a("PAYD")
+    if not payment_date:
+        payment_date = _parse_98a("VALU")
+
+    # Cash account IBAN: :97E::CASH//IBAN/<IBAN>  or  :97E::CASH//IBAN\n<IBAN>
+    cash_account_iban = rx(r":97[A-Z]::CASH//(?:IBAN/?)?\s*([A-Z]{2}[0-9A-Z]{10,32})", text)
+    if not cash_account_iban:
+        m_iban = re.search(r":97[A-Z]::CASH\b[^\n]*\n([A-Z]{2}[0-9]{10,32})", text)
+        if m_iban:
+            cash_account_iban = m_iban.group(1).strip()
+
+    account_number_key = cash_account_iban[-16:] if cash_account_iban and len(cash_account_iban) >= 16 else None
+
+    # Auto-generate comment
+    amount_str = f"{cash_amount:,.2f} {currency}" if cash_amount and currency else "N/A"
+    comment_parts = {
+        "DIVIDEND": f"Cash Dividend | ISIN {isin or 'N/A'} | {amount_str} | Pay Date {payment_date or 'N/A'}",
+        "COUPON": f"Interest Payment | ISIN {isin or 'N/A'} | {amount_str} | Pay Date {payment_date or 'N/A'}",
+        "PARTIAL_REDEMPTION": f"Partial Redemption | ISIN {isin or 'N/A'} | Nominal {nominal or 'N/A'} | {amount_str} | Date {payment_date or 'N/A'}",
+        "FULL_REDEMPTION": f"Full Redemption | ISIN {isin or 'N/A'} | Nominal {nominal or 'N/A'} | {amount_str} | Date {payment_date or 'N/A'}",
+    }
+    comment = comment_parts.get(action_type, "")
+
+    return {
+        "pdf_filename": filename,
+        "seme": seme,
+        "action_type": action_type,
+        "isin": isin,
+        "cash_amount": cash_amount,
+        "currency": currency,
+        "payment_date": payment_date,
+        "tax_amount": tax_amount,
+        "charges_amount": charges_amount,
+        "nominal": nominal,
+        "cash_account_iban": cash_account_iban,
+        "account_number_key": account_number_key,
+        "comment": comment,
+    }
+
+
+def _lookup_gl_account(conn, account_number_key: Optional[str]) -> Optional[str]:
+    """Look up gl_account_name from back_office.tab_gl_account by last 16 chars of account_number."""
+    if not account_number_key:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT account_name FROM back_office.tab_gl_account "
+            "WHERE RIGHT(account_number::text, 16) = %s LIMIT 1",
+            (account_number_key,)
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def _insert_mt566_parsed(conn, data: Dict[str, Any]) -> Optional[int]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO back_office_auto.tab_mt566_parsed
+                (received_at, pdf_filename, seme, action_type, isin,
+                 cash_amount, currency, payment_date,
+                 tax_amount, charges_amount, nominal,
+                 cash_account_iban, account_number_key, gl_account_name, comment, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            data["received_at"],
+            data.get("pdf_filename"),
+            data.get("seme"),
+            data["action_type"],
+            data.get("isin"),
+            data.get("cash_amount"),
+            data.get("currency"),
+            data.get("payment_date"),
+            data.get("tax_amount"),
+            data.get("charges_amount"),
+            data.get("nominal"),
+            data.get("cash_account_iban"),
+            data.get("account_number_key"),
+            data.get("gl_account_name"),
+            data.get("comment"),
+            data.get("status", "pending"),
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
+
+
+def _process_mt566_message(
+    conn,
+    token: str,
+    mailbox: str,
+    msg: Dict[str, Any],
+    internet_message_id: str,
+    subject: str,
+    received_at,
+    processing_run_id: int,
+) -> Tuple[str, int]:
+    """Handle FAB MT566 corporate action emails — parse PDFs and store to tab_mt566_parsed."""
+    if email_already_processed(conn, internet_message_id):
+        return ("ALREADY_PROCESSED", 0)
+
+    message_id = msg["id"]
+    attachments = get_message_attachments(token, mailbox, message_id)
+
+    insert_settlement_email(
+        conn=conn,
+        internet_message_id=internet_message_id,
+        message_id=message_id,
+        sender="noreply@bankfab.com",
+        subject=subject,
+        received_at=received_at,
+        status="RECEIVED",
+        note="FAB MT566 received",
+        mailbox=mailbox,
+        attachment_count=len(attachments),
+        parsed_trade_count=0,
+        processing_run_id=processing_run_id,
+    )
+
+    parsed_count = 0
+    for att in attachments:
+        if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
+            continue
+        filename = att.get("name") or "unnamed"
+        if not filename.lower().endswith(".pdf"):
+            continue
+        content_b64 = att.get("contentBytes")
+        if not content_b64:
+            continue
+        file_bytes = base64.b64decode(content_b64)
+        text = extract_pdf_text(file_bytes)
+        result = parse_mt566_pdf(text, filename)
+        if not result:
+            logging.warning("MT566: could not parse %s", filename)
+            continue
+
+        # Dedup by SEME
+        if result.get("seme"):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM back_office_auto.tab_mt566_parsed WHERE seme = %s LIMIT 1",
+                    (result["seme"],)
+                )
+                if cur.fetchone():
+                    logging.info("MT566: duplicate seme=%s, skipping", result["seme"])
+                    continue
+
+        result["received_at"] = received_at
+        gl_account_name = _lookup_gl_account(conn, result.get("account_number_key"))
+        result["gl_account_name"] = gl_account_name
+        result["status"] = "pending" if gl_account_name else "review_required"
+
+        if not gl_account_name:
+            logging.warning(
+                "MT566: GL account not found for IBAN key=%s, file=%s",
+                result.get("account_number_key"), filename,
+            )
+
+        _insert_mt566_parsed(conn, result)
+        parsed_count += 1
+
+    status = "PARSED" if parsed_count > 0 else "NO_TRADES_FOUND"
+    insert_settlement_email(
+        conn=conn,
+        internet_message_id=internet_message_id,
+        message_id=message_id,
+        sender="noreply@bankfab.com",
+        subject=subject,
+        received_at=received_at,
+        status=status,
+        note=f"MT566 parsed: {parsed_count}",
+        mailbox=mailbox,
+        attachment_count=len(attachments),
+        parsed_trade_count=parsed_count,
+        processing_run_id=processing_run_id,
+    )
+    return (status, parsed_count)
