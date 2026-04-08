@@ -4942,13 +4942,8 @@ def process_message(
         return ("SKIPPED", 0)
 
     # CMF emails from trading desk: route to dedicated handler
-    _CMF_SENDERS = {
-        "a.douggui@amwealth.ae",
-        "trading@amwealth.ae",
-        "a.krivolapov@amwealth.ae",
-    }
     subj_lower = (subject or "").lower()
-    if sender in _CMF_SENDERS and "cash management facilit" in subj_lower:
+    if sender.endswith("@amwealth.ae") and "cash management facilit" in subj_lower:
         return _process_cmf_message(
             conn=conn, token=token, mailbox=mailbox, msg=msg,
             sender=sender,
@@ -5130,13 +5125,6 @@ def settlement_email_parser_timer(mytimer=None) -> None:
 
         mapping_by_sender = load_mapping(conn)
         allowed_senders = get_allowed_senders(mapping_by_sender)
-        # CMF internal senders (not in counterparty_email_mapping)
-        allowed_senders.update({
-            "a.douggui@amwealth.ae",
-            "trading@amwealth.ae",
-            "a.krivolapov@amwealth.ae",
-        })
-
         since_dt = now_utc() - timedelta(hours=LOOKBACK_HOURS)
 
         total = 0
@@ -5146,10 +5134,12 @@ def settlement_email_parser_timer(mytimer=None) -> None:
 
         for mailbox in GRAPH_MAILBOXES:
             messages = list_recent_messages(token, mailbox, since_dt)
+            logging.info("EMAIL_PARSER mailbox=%s messages_count=%d since=%s", mailbox, len(messages), since_dt.isoformat())
             for msg in messages:
                 total += 1
                 sender = normalize_email_address(msg.get("from", {}))
-                if not is_sender_allowed(sender, allowed_senders):
+                # Allow internal @amwealth.ae senders (for CMF emails)
+                if not is_sender_allowed(sender, allowed_senders) and not sender.endswith("@amwealth.ae"):
                     skipped += 1
                     continue
 
