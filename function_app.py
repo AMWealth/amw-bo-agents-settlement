@@ -3868,22 +3868,41 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                 """, (isin, action_val))
             return [dict(r) for r in cur.fetchall()]
 
-    def _resolve_instruction_amount(deal_id, isin_val):
-        """For CMF (login=5) deals, resolve the actual netted amount from tab_instructions."""
+    def _resolve_instruction_amount(deal_id, isin_val, sett_date_val=None):
+        """For CMF (login=5) deals, resolve the actual netted amount from tab_instructions.
+        Direct lookup by ISIN + instruction_type + value_date (CMF chain is often empty)."""
+        side_text = None  # will be set below
+        # First get deal's action to determine instruction_type
+        with conn.cursor() as cur:
+            cur.execute("SELECT action FROM back_office.tab_deals WHERE id = %s", (deal_id,))
+            r = cur.fetchone()
+            if r:
+                side_text = 'BUY' if r[0] == 0 else 'SELL'
+        if not side_text:
+            return None
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Try with date match first
+            if sett_date_val:
+                cur.execute("""
+                    SELECT id AS instruction_id, net_settlement_amount, quantity,
+                           value_date AS instr_value_date
+                    FROM back_office.tab_instructions
+                    WHERE isin = %s AND instruction_type = %s AND value_date = %s
+                      AND net_settlement_amount IS NOT NULL
+                    ORDER BY id DESC LIMIT 1
+                """, (isin_val, side_text, sett_date_val))
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+            # Fallback: latest instruction for this ISIN + side
             cur.execute("""
-                SELECT i.id AS instruction_id,
-                       i.net_settlement_amount,
-                       i.quantity,
-                       i.value_date AS instr_value_date
-                FROM back_office.tab_connect_deal_transfer cdt
-                JOIN back_office.tab_transfer tf ON tf.id = cdt.id_transfer
-                JOIN back_office.tab_settlements ts ON ts.id = tf.id_settlement
-                JOIN back_office.tab_instructions i ON i.id_amwl = ts.id::text
-                WHERE cdt.id_deal = %s AND i.isin = %s
-                ORDER BY i.id DESC
-                LIMIT 1
-            """, (deal_id, isin_val))
+                SELECT id AS instruction_id, net_settlement_amount, quantity,
+                       value_date AS instr_value_date
+                FROM back_office.tab_instructions
+                WHERE isin = %s AND instruction_type = %s
+                  AND net_settlement_amount IS NOT NULL
+                ORDER BY id DESC LIMIT 1
+            """, (isin_val, side_text))
             row = cur.fetchone()
             return dict(row) if row else None
 
@@ -3933,7 +3952,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
 
             # For CMF trades (login=5), resolve amount from tab_instructions
             if best.get("login") == 5:
-                instr = _resolve_instruction_amount(best["id"], isin)
+                instr = _resolve_instruction_amount(best["id"], isin, sett_date)
                 if instr and instr.get("net_settlement_amount") is not None:
                     int_amount = instr["net_settlement_amount"]
                     int_face = instr.get("quantity") or best.get("nominal") or best.get("qty")
