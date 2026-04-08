@@ -3868,6 +3868,25 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                 """, (isin, action_val))
             return [dict(r) for r in cur.fetchall()]
 
+    def _resolve_instruction_amount(deal_id, isin_val):
+        """For CMF (login=5) deals, resolve the actual netted amount from tab_instructions."""
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT i.id AS instruction_id,
+                       i.net_settlement_amount,
+                       i.quantity,
+                       i.value_date AS instr_value_date
+                FROM back_office.tab_connect_deal_transfer cdt
+                JOIN back_office.tab_transfer tf ON tf.id = cdt.id_transfer
+                JOIN back_office.tab_settlements ts ON ts.id = tf.id_settlement
+                JOIN back_office.tab_instructions i ON i.id_amwl = ts.id::text
+                WHERE cdt.id_deal = %s AND i.isin = %s
+                ORDER BY i.id DESC
+                LIMIT 1
+            """, (deal_id, isin_val))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
     # Pre-load set of (ISIN, action) pairs that have at least one deal with login IN (1,5)
     # Used to skip NOT_FOUND rows where no FAB/CMF deals exist for that side
     _fab_isin_actions = set()
@@ -3911,8 +3930,21 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
             row["counterparty"] = None
         else:
             best = candidates[0]
-            int_amount = best.get("net_amount") or best.get("transaction_value")
-            int_face = best.get("nominal") or best.get("qty")
+
+            # For CMF trades (login=5), resolve amount from tab_instructions
+            if best.get("login") == 5:
+                instr = _resolve_instruction_amount(best["id"], isin)
+                if instr and instr.get("net_settlement_amount") is not None:
+                    int_amount = instr["net_settlement_amount"]
+                    int_face = instr.get("quantity") or best.get("nominal") or best.get("qty")
+                else:
+                    # Fallback: use deal amount if no instruction found
+                    int_amount = best.get("net_amount") or best.get("transaction_value")
+                    int_face = best.get("nominal") or best.get("qty")
+            else:
+                int_amount = best.get("net_amount") or best.get("transaction_value")
+                int_face = best.get("nominal") or best.get("qty")
+
             int_value_date = best.get("settle_date_cash") or best.get("value_date_cash")
 
             # Amount difference
@@ -3932,17 +3964,19 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                        or (int_face is not None
                            and values_equal_decimal(sw_face, int_face, Decimal("0.0001"))))
 
+            cmf_tag = " [CMF: matched via instruction]" if best.get("login") == 5 else ""
+
             if not date_matched:
                 match_status = "DATE_MISMATCH"
                 diff_str = f" Δ={amount_diff:+.2f}" if amount_diff is not None else ""
-                match_note = f"Fallback match (date {sett_date} not found); settled={sw_amount} vs internal={int_amount}{diff_str}"
+                match_note = f"Fallback match (date {sett_date} not found); settled={sw_amount} vs internal={int_amount}{diff_str}{cmf_tag}"
             elif amount_ok:
                 match_status = "MATCHED"
-                match_note = None if face_ok else f"face_amount mismatch: pdf={sw_face} vs system={int_face}"
+                match_note = (None if face_ok else f"face_amount mismatch: pdf={sw_face} vs system={int_face}") if not cmf_tag else f"amount OK{cmf_tag}"
             else:
                 match_status = "AMOUNT_MISMATCH"
                 diff_str = f" Δ={amount_diff:+.2f}" if amount_diff is not None else ""
-                match_note = f"settled={sw_amount} vs internal={int_amount}{diff_str}"
+                match_note = f"settled={sw_amount} vs internal={int_amount}{diff_str}{cmf_tag}"
 
             row = dict(sw)
             row["match_status"] = match_status
