@@ -7565,6 +7565,9 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
     if cash_amount is None:
         currency, cash_amount = _parse_19b("GRSS")
 
+    # ── Gross Amount: :19B::GRSS ──
+    _, gross_amount = _parse_19b("GRSS")
+
     # ── Tax: :19B::TAXR (Withholding Tax Amount), 0 if absent ──
     _, tax_amount = _parse_19b("TAXR")
     if tax_amount is None:
@@ -7671,6 +7674,7 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
         "action_type": action_type,
         "isin": isin,
         "cash_amount": cash_amount,
+        "gross_amount": gross_amount,
         "currency": currency,
         "payment_date": payment_date,
         "trade_date": trade_date,
@@ -7703,15 +7707,16 @@ def _insert_mt566_parsed(conn, data: Dict[str, Any]) -> Optional[int]:
         cur.execute("""
             INSERT INTO back_office_auto.tab_mt566_parsed
                 (received_at, pdf_filename, seme, action_type, isin,
-                 cash_amount, currency, payment_date, trade_date,
+                 cash_amount, gross_amount, currency, payment_date, trade_date,
                  tax_amount, charges_amount, nominal,
                  cash_account_iban, account_number_key, gl_account_name, comment, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (seme) DO UPDATE SET
                 pdf_filename = EXCLUDED.pdf_filename,
                 action_type = EXCLUDED.action_type,
                 isin = EXCLUDED.isin,
                 cash_amount = EXCLUDED.cash_amount,
+                gross_amount = EXCLUDED.gross_amount,
                 currency = EXCLUDED.currency,
                 payment_date = EXCLUDED.payment_date,
                 trade_date = EXCLUDED.trade_date,
@@ -7732,6 +7737,7 @@ def _insert_mt566_parsed(conn, data: Dict[str, Any]) -> Optional[int]:
             data["action_type"],
             data.get("isin"),
             data.get("cash_amount"),
+            data.get("gross_amount"),
             data.get("currency"),
             data.get("payment_date"),
             data.get("trade_date"),
