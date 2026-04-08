@@ -7301,7 +7301,8 @@ def run_email_parser_http(req: func.HttpRequest) -> func.HttpResponse:
             for msg in messages:
                 total += 1
                 sender = normalize_email_address(msg.get("from", {}))
-                if not is_sender_allowed(sender, allowed_senders):
+                # Allow internal @amwealth.ae senders (for CMF emails)
+                if not is_sender_allowed(sender, allowed_senders) and not sender.endswith("@amwealth.ae"):
                     skipped += 1
                     continue
                 status, count = process_message(
@@ -7365,7 +7366,8 @@ def daily_email_parser(timer: func.TimerRequest) -> None:
             for msg in messages:
                 total += 1
                 sender = normalize_email_address(msg.get("from", {}))
-                if not is_sender_allowed(sender, allowed_senders):
+                # Allow internal @amwealth.ae senders (for CMF emails)
+                if not is_sender_allowed(sender, allowed_senders) and not sender.endswith("@amwealth.ae"):
                     skipped += 1
                     continue
                 status, count = process_message(
