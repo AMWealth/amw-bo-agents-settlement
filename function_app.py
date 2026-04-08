@@ -7398,26 +7398,44 @@ def daily_reconciliation(timer: func.TimerRequest) -> None:
 def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
     """Parse FAB MT566 corporate action PDF.
     FAB SWIFT PDFs render fields with text labels, e.g.:
-      :98A::PAYD Payment Date 2026-04-06
-      :19B::ENTL Entitled Amount USD 5250,00
-      :36B::PSTA Face Amount 100000,
-    ISIN appears on a line BEFORE ':35B:' (same as MT545/MT547).
+      :19B::NETT  Net Cash Amount       USD  144,65
+      :19B::GRSS  Gross Amount           USD  206,65
+      :19B::TAXR  Withholding Tax Amount USD  62,
+      :93B::ELIG  Total Eligible ...     Unit Number  1850,
+      :98A::RDTE  Record Date/Time       2026-04-01
+      :69A::INPE  Interest Period        2025-10-03/2026-04-03
+      :98A::VALU  Value Date/Time        2026-04-07
     """
     text_upper = text.upper()
 
     # Log first 2000 chars for debugging
     logging.warning("MT566_DEBUG file=%s | text_start=%r", filename, text[:2000])
 
-    # Detect action type by PDF content
+    # Detect action type via :22F::CAEV field
     action_type = None
-    if re.search(r"FULL\s+REDEMPTION|CALL\s+REDEMPTION|REDEMPTION.*FULL|REDM", text_upper):
-        action_type = "FULL_REDEMPTION"
-    elif re.search(r"PARTIAL\s+REDEMPTION|PRED", text_upper):
-        action_type = "PARTIAL_REDEMPTION"
-    elif re.search(r"INTEREST\s+PAYMENT|INTR|COUPON|COUPN", text_upper):
-        action_type = "COUPON"
-    elif re.search(r"CASH\s+DIVIDEND|DVCA|DIVIDEND", text_upper):
-        action_type = "DIVIDEND"
+    caev = rx(r":22F::CAEV[^\n]*(Interest Payment|Cash Dividend|Full Redemption|"
+              r"Partial Redemption|Call Redemption)", text)
+    if caev:
+        caev_upper = caev.upper()
+        if "INTEREST" in caev_upper:
+            action_type = "COUPON"
+        elif "DIVIDEND" in caev_upper:
+            action_type = "DIVIDEND"
+        elif "FULL" in caev_upper or "CALL" in caev_upper:
+            action_type = "FULL_REDEMPTION"
+        elif "PARTIAL" in caev_upper:
+            action_type = "PARTIAL_REDEMPTION"
+
+    # Fallback: keyword search
+    if not action_type:
+        if re.search(r"FULL\s+REDEMPTION|CALL\s+REDEMPTION", text_upper):
+            action_type = "FULL_REDEMPTION"
+        elif re.search(r"PARTIAL\s+REDEMPTION", text_upper):
+            action_type = "PARTIAL_REDEMPTION"
+        elif re.search(r"INTEREST\s+PAYMENT", text_upper):
+            action_type = "COUPON"
+        elif re.search(r"CASH\s+DIVIDEND", text_upper):
+            action_type = "DIVIDEND"
 
     if not action_type:
         logging.warning("MT566_PARSER: cannot detect action_type in %s", filename)
@@ -7425,9 +7443,11 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
 
     # SEME — dedup key: :20C::SEME//<ref> or :20C::SEME //<ref>
     seme = rx(r":20C::SEME\s*//(\S+)", text)
+    # Fallback: :20C::PREV (Previous Message Reference)
+    if not seme:
+        seme = rx(r":20C::PREV\s*[^\n]*?(\d{10,})", text)
 
     # ── ISIN ──
-    # FAB SWIFT PDFs: ISIN appears on line BEFORE ':35B:' (same as MT545/MT547)
     _ISIN_PREFIXES = (
         "US", "XS", "DE", "GB", "IE", "FR", "NL", "CH", "IT", "ES",
         "AU", "CA", "JP", "HK", "SG", "SE", "NO", "DK", "FI", "AT",
@@ -7437,7 +7457,7 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
     )
     _isin_alt = "|".join(_ISIN_PREFIXES)
     isin = None
-    # Pattern 1: ISIN on line immediately before :35B:
+    # Pattern 1: ISIN on line before :35B:
     _m = re.search(r"\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b\s*\n\s*:35B:", text)
     if _m:
         isin = _m.group(1)
@@ -7446,34 +7466,27 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
         _m2 = re.search(r"\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b(?:[^\n]*\n){0,3}[^\n]*:35B:", text)
         if _m2:
             isin = _m2.group(1)
-    # Pattern 3: :35B::ISIN//XS... (raw SWIFT format)
+    # Pattern 3: after :97A::SAFE (Safekeeping Account section)
     if not isin:
-        isin = rx(r":35B::ISIN//([A-Z]{2}[A-Z0-9]{10})", text)
-    # Pattern 4: ISIN on same line after :35B:
-    if not isin:
-        _m4 = re.search(r":35B:[^\n]*\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b", text)
-        if _m4:
-            isin = _m4.group(1)
-    # Pattern 5: any 12-char ISIN-like string anywhere in text
+        _m3 = re.search(r":97A::SAFE[^\n]*\n(?:[^\n]*\n){0,3}[^\n]*\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b", text)
+        if _m3:
+            isin = _m3.group(1)
+    # Pattern 4: any ISIN in text
     if not isin:
         _m5 = re.search(r"\b((?:" + _isin_alt + r")[A-Z0-9]{10})\b", text)
         if _m5:
             isin = _m5.group(1)
 
-    logging.warning("MT566_DEBUG file=%s | isin=%s", filename, isin)
-
-    # ── Amounts ──
-    # FAB format: ":19B::ENTL Entitled Amount USD 5250,00"  or  ":19B::ENTL//USD5250,00"
+    # ── Helper: parse :19B:: amounts ──
     def _parse_19b(tag: str) -> Tuple[Optional[str], Optional[Decimal]]:
-        # Try raw SWIFT format first: :19B::TAG//CCY12345,67
+        # :19B::TAG//CCY12345,67
         m = re.search(rf":19B::{tag}//([A-Z]{{3}})([\d,\.]+)", text, re.IGNORECASE)
         if not m:
-            # FAB PDF format: :19B::TAG ... CCY 12345,67  (with text labels between)
+            # FAB PDF: :19B::TAG ... CCY 12345,67
             m = re.search(rf":19B::{tag}\b[^\n]*?([A-Z]{{3}})\s+([\d,\.]+)", text, re.IGNORECASE)
         if m:
             ccy = m.group(1).upper()
             raw = m.group(2).rstrip(",")
-            # European decimal comma: "5250,00" → "5250.00"
             if re.search(r",\d{1,2}$", raw):
                 raw = raw.replace(",", ".")
             else:
@@ -7481,22 +7494,30 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
             return ccy, parse_decimal(raw)
         return None, None
 
-    currency, cash_amount = _parse_19b("ENTL")
+    # ── Amount: NETT first (what Sharly enters), fallback to GRSS ──
+    currency, cash_amount = _parse_19b("NETT")
     if cash_amount is None:
         currency, cash_amount = _parse_19b("GRSS")
-    if cash_amount is None:
-        currency, cash_amount = _parse_19b("NETT")
 
-    _, tax_amount = _parse_19b("WITL")
+    # ── Tax: :19B::TAXR (Withholding Tax Amount), 0 if absent ──
+    _, tax_amount = _parse_19b("TAXR")
+    if tax_amount is None:
+        _, tax_amount = _parse_19b("WITL")
+    if tax_amount is None:
+        tax_amount = Decimal("0")
+
+    # ── Charges: :19B::CHAR, 0 if absent ──
     _, charges_amount = _parse_19b("CHAR")
+    if charges_amount is None:
+        charges_amount = Decimal("0")
 
-    # ── Nominal ──
-    # FAB format: ":36B::PSTA Face Amount 100000,"  or  ":36B::PSTA//FAMT/100000,"
-    nominal_raw = rx(r":36B::PSTA//\w+/([\d,\.]+)", text)
+    # ── Nominal: :93B::ELIG (Total Eligible for Corporate Action Balance) ──
+    # FAB PDF: ":93B::ELIG ... Unit Number 1850,"  or  "Face Amount 200000,"
+    nominal_raw = rx(r":93B::ELIG[^\n]*?(?:Unit Number|Face Amount|Quantity)\s+([\d,\.]+)", text)
     if not nominal_raw:
-        nominal_raw = rx(r":36B::PSTA[^\n]*?(?:Face Amount|Quantity|Unit)[^\d]*([\d,\.]+)", text)
+        nominal_raw = rx(r":93B::ELIG\b[^\n]*([\d][\d,\.]*)", text)
     if not nominal_raw:
-        nominal_raw = rx(r":36B::PSTA\b[^\n]*([\d][\d,\.]*)", text)
+        nominal_raw = rx(r":93B::CONB[^\n]*?(?:Unit Number|Face Amount|Quantity)\s+([\d,\.]+)", text)
     nominal = None
     if nominal_raw:
         nominal_raw = nominal_raw.rstrip(",")
@@ -7506,51 +7527,67 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
             nominal_raw = nominal_raw.replace(",", "")
         nominal = parse_decimal(nominal_raw)
 
-    logging.warning("MT566_DEBUG file=%s | nominal=%s", filename, nominal)
-
-    # ── Payment date ──
-    # FAB format: ":98A::PAYD Payment Date 2026-04-06"  or  ":98A::PAYD//20260406"
+    # ── Helper: parse :98A:: dates ──
     def _parse_98a(tag: str) -> Optional[date]:
-        # Compact: //YYYYMMDD
         raw = rx(rf":98A::{tag}\s*//(\d{{8}})", text)
         if raw:
             raw = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
             return parse_date_any(raw, prefer_day_first=False)
-        # ISO: YYYY-MM-DD anywhere on the line
         raw = rx(rf":98A::{tag}\b[^\n]*?(\d{{4}}-\d{{2}}-\d{{2}})", text)
         if raw:
             return parse_date_any(raw, prefer_day_first=False)
-        # European: DD.MM.YYYY
-        raw = rx(rf":98A::{tag}\b[^\n]*?(\d{{2}}\.\d{{2}}\.\d{{4}})", text)
-        if raw:
-            return parse_date_any(raw, prefer_day_first=True)
         return None
 
-    payment_date = _parse_98a("PAYD")
+    # ── Value date: :98A::VALU or :98A::PAYD ──
+    payment_date = _parse_98a("VALU")
     if not payment_date:
-        payment_date = _parse_98a("VALU")
+        payment_date = _parse_98a("PAYD")
+
+    # ── Trade date ──
+    trade_date = None
+    if action_type == "COUPON":
+        # Interest Period :69A::INPE — take SECOND (latest) date
+        # FAB PDF: ":69A::INPE Interest Period 2025-10-03/2026-04-03"
+        inpe_raw = rx(r":69A::INPE\b[^\n]*?(\d{4}-\d{2}-\d{2})/(\d{4}-\d{2}-\d{2})", text)
+        if not inpe_raw:
+            # Try full line with both dates
+            m_inpe = re.search(r":69A::INPE\b[^\n]*?(\d{4}-\d{2}-\d{2})[^\d]+(\d{4}-\d{2}-\d{2})", text)
+            if m_inpe:
+                trade_date = parse_date_any(m_inpe.group(2), prefer_day_first=False)
+        else:
+            # rx returns first group only; re-search for both dates
+            m_inpe2 = re.search(r":69A::INPE\b[^\n]*?(\d{4}-\d{2}-\d{2})/(\d{4}-\d{2}-\d{2})", text)
+            if m_inpe2:
+                trade_date = parse_date_any(m_inpe2.group(2), prefer_day_first=False)
+    if not trade_date and action_type == "DIVIDEND":
+        # Record Date :98A::RDTE
+        trade_date = _parse_98a("RDTE")
+    if not trade_date:
+        # Fallback: RDTE for any type
+        trade_date = _parse_98a("RDTE")
 
     # ── Cash account IBAN ──
-    # FAB format: ":97E::CASH Cash Account\nIBAN AE12345..."  or  ":97A::CASH//AE12345..."
     cash_account_iban = None
-    # Try :97E::CASH or :97A::CASH with IBAN on same or next line
     m_iban = re.search(r":97[A-Z]::CASH[^\n]*?(?:IBAN[/\s]*)?\b([A-Z]{2}\d{2}[0-9A-Z]{8,30})\b", text)
     if m_iban:
         cash_account_iban = m_iban.group(1)
     if not cash_account_iban:
-        # IBAN on the next line after :97E::CASH
         m_iban2 = re.search(r":97[A-Z]::CASH[^\n]*\n\s*(?:IBAN[/\s]*)?\b([A-Z]{2}\d{2}[0-9A-Z]{8,30})\b", text)
         if m_iban2:
             cash_account_iban = m_iban2.group(1)
     if not cash_account_iban:
-        # Generic IBAN anywhere in text (AE + 21 digits for UAE)
         m_iban3 = re.search(r"\b(AE\d{21})\b", text)
         if m_iban3:
             cash_account_iban = m_iban3.group(1)
 
-    logging.warning("MT566_DEBUG file=%s | iban=%s", filename, cash_account_iban)
-
     account_number_key = cash_account_iban[-16:] if cash_account_iban and len(cash_account_iban) >= 16 else None
+
+    logging.warning(
+        "MT566_PARSED file=%s | type=%s isin=%s amount=%s ccy=%s tax=%s charges=%s nominal=%s "
+        "trade_date=%s value_date=%s iban=%s seme=%s",
+        filename, action_type, isin, cash_amount, currency, tax_amount, charges_amount,
+        nominal, trade_date, payment_date, cash_account_iban, seme,
+    )
 
     # Auto-generate comment
     amount_str = f"{cash_amount:,.2f} {currency}" if cash_amount and currency else "N/A"
@@ -7570,6 +7607,7 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
         "cash_amount": cash_amount,
         "currency": currency,
         "payment_date": payment_date,
+        "trade_date": trade_date,
         "tax_amount": tax_amount,
         "charges_amount": charges_amount,
         "nominal": nominal,
@@ -7599,10 +7637,10 @@ def _insert_mt566_parsed(conn, data: Dict[str, Any]) -> Optional[int]:
         cur.execute("""
             INSERT INTO back_office_auto.tab_mt566_parsed
                 (received_at, pdf_filename, seme, action_type, isin,
-                 cash_amount, currency, payment_date,
+                 cash_amount, currency, payment_date, trade_date,
                  tax_amount, charges_amount, nominal,
                  cash_account_iban, account_number_key, gl_account_name, comment, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (seme) DO UPDATE SET
                 pdf_filename = EXCLUDED.pdf_filename,
                 action_type = EXCLUDED.action_type,
@@ -7610,6 +7648,7 @@ def _insert_mt566_parsed(conn, data: Dict[str, Any]) -> Optional[int]:
                 cash_amount = EXCLUDED.cash_amount,
                 currency = EXCLUDED.currency,
                 payment_date = EXCLUDED.payment_date,
+                trade_date = EXCLUDED.trade_date,
                 tax_amount = EXCLUDED.tax_amount,
                 charges_amount = EXCLUDED.charges_amount,
                 nominal = EXCLUDED.nominal,
@@ -7629,6 +7668,7 @@ def _insert_mt566_parsed(conn, data: Dict[str, Any]) -> Optional[int]:
             data.get("cash_amount"),
             data.get("currency"),
             data.get("payment_date"),
+            data.get("trade_date"),
             data.get("tax_amount"),
             data.get("charges_amount"),
             data.get("nominal"),
