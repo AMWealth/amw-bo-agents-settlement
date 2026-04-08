@@ -7565,8 +7565,9 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
     if cash_amount is None:
         currency, cash_amount = _parse_19b("GRSS")
 
-    # ── Gross Amount: :19B::GRSS ──
+    # ── Gross Amount: :19B::GRSS, fallback to net + tax + charges ──
     _, gross_amount = _parse_19b("GRSS")
+    # gross_amount fallback computed after tax/charges are parsed (see below)
 
     # ── Tax: :19B::TAXR (Withholding Tax Amount), 0 if absent ──
     _, tax_amount = _parse_19b("TAXR")
@@ -7579,6 +7580,10 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
     _, charges_amount = _parse_19b("CHAR")
     if charges_amount is None:
         charges_amount = Decimal("0")
+
+    # ── Gross Amount fallback: net + tax + charges ──
+    if gross_amount is None and cash_amount is not None:
+        gross_amount = cash_amount + tax_amount + charges_amount
 
     # ── Nominal: :93B::ELIG (Total Eligible for Corporate Action Balance) ──
     # FAB PDF: ":93B::ELIG ... Unit Number 1850,"  or  "Face Amount 200000,"
