@@ -5096,6 +5096,12 @@ def settlement_email_parser_timer(mytimer=None) -> None:
 
         mapping_by_sender = load_mapping(conn)
         allowed_senders = get_allowed_senders(mapping_by_sender)
+        # CMF internal senders (not in counterparty_email_mapping)
+        allowed_senders.update({
+            "a.douggui@amwealth.ae",
+            "trading@amwealth.ae",
+            "a.krivolapov@amwealth.ae",
+        })
 
         since_dt = now_utc() - timedelta(hours=LOOKBACK_HOURS)
 
