@@ -7816,10 +7816,16 @@ def _process_mt566_message(
 # =============================================================================
 
 def _strip_html(html_text: str) -> str:
-    """Strip HTML tags and decode entities, return plain text."""
+    """Strip HTML tags and decode entities, return plain text.
+    Converts table cells and rows to structured text with colons and newlines."""
     import re as _re
     from html import unescape
-    text = _re.sub(r'<br\s*/?>', '\n', html_text, flags=_re.IGNORECASE)
+    text = html_text
+    # Table row boundaries → newline
+    text = _re.sub(r'</tr\s*>', '\n', text, flags=_re.IGNORECASE)
+    # Adjacent cells: </td><td> → colon separator (for label:value tables)
+    text = _re.sub(r'</td>\s*<td[^>]*>', ': ', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'<br\s*/?>', '\n', text, flags=_re.IGNORECASE)
     text = _re.sub(r'<[^>]+>', ' ', text)
     text = unescape(text)
     text = _re.sub(r'[^\S\n]+', ' ', text)
@@ -7910,7 +7916,7 @@ def parse_cmf_email(body_text: str) -> Optional[Dict[str, Any]]:
             return None
 
     # --- Parse ISIN ---
-    m = _re.search(r'ISIN\s*:\s*([A-Z]{2}[A-Z0-9]{9,10})', text)
+    m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', text)
     if m:
         result['isin'] = m.group(1)
 
@@ -7978,34 +7984,34 @@ def parse_cmf_email(body_text: str) -> Optional[Dict[str, Any]]:
         ni_text = ni_block.group(1) if ni_block else text
 
         # ISIN from netting block
-        m = _re.search(r'ISIN\s*:\s*([A-Z]{2}[A-Z0-9]{9,10})', ni_text)
+        m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', ni_text)
         if m:
             result['isin'] = m.group(1)
 
         # FAMT Close
-        m = _re.search(r'FAMT\s+Close\s*:\s*([\d,.\s]+)', ni_text, _re.IGNORECASE)
+        m = _re.search(r'FAMT\s+Close\s*:?\s*([\d,.\s]+)', ni_text, _re.IGNORECASE)
         if m:
             result['famt_close'] = _parse_number(m.group(1))
 
         # Interest
-        m = _re.search(r'Interest\s*:\s*\$?\s*([\d,.\s]+)', ni_text, _re.IGNORECASE)
+        m = _re.search(r'Interest\s*:?\s*\$?\s*([\d,.\s]+)', ni_text, _re.IGNORECASE)
         if m:
             result['interest'] = _parse_number(m.group(1))
 
         # Wired In (net amount for close)
-        m = _re.search(r'Wired\s+In\s*:\s*\$?\s*([\d,.\s]+)', ni_text, _re.IGNORECASE)
+        m = _re.search(r'Wired\s+In\s*:?\s*\$?\s*([\d,.\s]+)', ni_text, _re.IGNORECASE)
         if m:
             result['net_amount'] = _parse_number(m.group(1))
 
         # Trade date from netting
-        m = _re.search(r'Trade\s+date\s*:\s*([\d/.-]+)', ni_text, _re.IGNORECASE)
+        m = _re.search(r'Trade\s+date\s*:?\s*([\d/.-]+)', ni_text, _re.IGNORECASE)
         if m:
             result['trade_date'] = _parse_date_cmf(m.group(1))
 
         # Settlement date (SD)
-        m = _re.search(r'SD\s*:\s*([\d/.-]+)', ni_text)
+        m = _re.search(r'SD\s*:?\s*([\d/.-]+)', ni_text)
         if not m:
-            m = _re.search(r'Settlement\s+Date\s*:\s*([\d/.-]+)', ni_text, _re.IGNORECASE)
+            m = _re.search(r'Settlement\s+Date\s*:?\s*([\d/.-]+)', ni_text, _re.IGNORECASE)
         if m:
             result['settlement_date'] = _parse_date_cmf(m.group(1))
 
@@ -8079,8 +8085,16 @@ def _process_cmf_message(
     processing_run_id: int,
 ) -> Tuple[str, int]:
     """Handle CMF (Cash Management Facilities) emails — parse body and store to tab_cmf_parsed."""
-    if email_already_processed(conn, internet_message_id):
-        return ("ALREADY_PROCESSED", 0)
+    # Allow re-parsing: ON CONFLICT DO UPDATE will refresh data
+    # (skip only if already in tab_cmf_parsed with non-pending status)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT status FROM back_office_auto.tab_cmf_parsed WHERE email_id = %s",
+            (internet_message_id,)
+        )
+        existing = cur.fetchone()
+        if existing and existing[0] not in ('pending', 'review_required'):
+            return ("ALREADY_PROCESSED", 0)
 
     message_id = msg["id"]
 
@@ -8088,6 +8102,7 @@ def _process_cmf_message(
     full_msg = get_message_full(token, mailbox, message_id)
     body_html = (full_msg.get("body") or {}).get("content") or ""
     body_text = _strip_html(body_html)
+    logging.warning("CMF_PARSE body_text (first 2000 chars): %s", body_text[:2000])
 
     insert_settlement_email(
         conn=conn,
@@ -8134,7 +8149,22 @@ def _process_cmf_message(
                     %s, %s, %s, %s,
                     %s, %s, %s, %s, %s,
                     %s, %s, %s, 'pending')
-            ON CONFLICT (email_id) DO NOTHING
+            ON CONFLICT (email_id) DO UPDATE SET
+                email_type = EXCLUDED.email_type,
+                counterparty = EXCLUDED.counterparty,
+                isin = EXCLUDED.isin,
+                famt_close = EXCLUDED.famt_close,
+                famt_reopen = EXCLUDED.famt_reopen,
+                amount_close = EXCLUDED.amount_close,
+                amount_reopen = EXCLUDED.amount_reopen,
+                interest = EXCLUDED.interest,
+                net_amount = EXCLUDED.net_amount,
+                net_nominal = EXCLUDED.net_nominal,
+                rate = EXCLUDED.rate,
+                currency = EXCLUDED.currency,
+                trade_date = EXCLUDED.trade_date,
+                settlement_date = EXCLUDED.settlement_date,
+                ssi = EXCLUDED.ssi
         """, (
             internet_message_id,
             received_at,
