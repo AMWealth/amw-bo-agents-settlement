@@ -8404,6 +8404,28 @@ def _cmar_parse_attachment(fname: str, data: bytes) -> dict:
                     if any(v is not None for v in row)
                 ][:100]
 
+        elif fname_lower.endswith(".xlsx") and "statement_of_holdings" in fname_lower:
+            # StoneX Statement of Holdings — headers row 11, data from row 12, sheet RPSTHLD
+            wb2 = load_workbook(io.BytesIO(data), data_only=True)
+            ws2 = wb2["RPSTHLD"] if "RPSTHLD" in wb2.sheetnames else wb2.active
+            rows_out = []
+            for row in ws2.iter_rows(min_row=12, max_row=2000, values_only=True):
+                isin = str(row[1] or "").strip() if len(row) > 1 else ""
+                if not isin or isin.upper() == "SECURITY ISIN":
+                    continue
+                rows_out.append({
+                    "isin": isin,
+                    "name": str(row[2] or "") if len(row) > 2 else "",
+                    "market_code": str(row[3] or "") if len(row) > 3 else "",
+                    "security_type": str(row[4] or "") if len(row) > 4 else "",
+                    "qty": row[6] if len(row) > 6 else None,
+                    "price_date": str(row[7])[:10] if len(row) > 7 and row[7] else "",
+                    "exchange": "StoneX",
+                    "symbol": isin,
+                    "currency": "USD",
+                })
+            out["gtn_settled_holdings"].extend(rows_out)
+
         # ── PDF — log only, no auto-parse yet ────────────────────────────────
         elif fname_lower.endswith(".pdf"):
             logging.warning("CMAR_PARSER: PDF attachment '%s' — skipped (manual entry required)", fname)
@@ -8412,6 +8434,48 @@ def _cmar_parse_attachment(fname: str, data: bytes) -> dict:
         logging.exception("CMAR_PARSER: error parsing '%s': %s", fname, ex)
 
     return out
+
+
+def _cmar_parse_failed_trades_from_html(html_body: str) -> List[dict]:
+    """Extract failed trades table from CMAR email HTML body.
+    Expected columns: Our Side | ISIN | QTY | CCY | Trade Date | Settle Date | Net Amount | Counterparty | Failing Reason
+    """
+    if not html_body or "failing" not in html_body.lower():
+        return []
+    trades = []
+    try:
+        # Find all <tr> rows inside the failed trades table
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html_body, re.DOTALL | re.IGNORECASE)
+        header_found = False
+        for row in rows:
+            cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.DOTALL | re.IGNORECASE)
+            # Strip HTML tags from cell text
+            clean = [re.sub(r"<[^>]+>", "", c).strip() for c in cells]
+            if not clean:
+                continue
+            # Identify header row
+            joined = " ".join(clean).lower()
+            if "isin" in joined and ("side" in joined or "qty" in joined or "failing" in joined):
+                header_found = True
+                continue
+            if not header_found or len(clean) < 4:
+                continue
+            # Map columns: Side ISIN QTY CCY TradeDate SettleDate NetAmount Counterparty FailingReason
+            trades.append({
+                "side":          clean[0] if len(clean) > 0 else "",
+                "isin":          clean[1] if len(clean) > 1 else "",
+                "quantity":      clean[2] if len(clean) > 2 else None,
+                "currency":      clean[3] if len(clean) > 3 else "",
+                "trade_date":    clean[4] if len(clean) > 4 else "",
+                "settle_date":   clean[5] if len(clean) > 5 else "",
+                "net_amount":    clean[6] if len(clean) > 6 else None,
+                "counterparty":  clean[7] if len(clean) > 7 else "",
+                "failing_reason":clean[8] if len(clean) > 8 else "",
+                "description":   " | ".join(c for c in clean if c),
+            })
+    except Exception as ex:
+        logging.warning("CMAR failed trades parse error: %s", ex)
+    return trades
 
 
 def _cmar_merge_results(parts: List[dict]) -> dict:
@@ -8601,6 +8665,13 @@ def _cmar_run_parser(conn, token: str) -> dict:
                 continue
 
             try:
+                # Fetch full message to get body (for failed trades HTML table)
+                full_msg = get_message_full(token, mailbox, msg_id)
+                body_html = (full_msg.get("body") or {}).get("content", "")
+                failed_from_body = _cmar_parse_failed_trades_from_html(body_html)
+                logging.warning("CMAR_PARSER: found %d failed trades in email body for %s",
+                                len(failed_from_body), report_date)
+
                 attachments = get_message_attachments(token, mailbox, msg_id)
                 parts = []
                 for att in attachments:
@@ -8614,6 +8685,7 @@ def _cmar_run_parser(conn, token: str) -> dict:
                     logging.warning("CMAR_PARSER: parsed attachment '%s' for %s", att_name, report_date)
 
                 result = _cmar_merge_results(parts)
+                result["failed_trades"].extend(failed_from_body)
                 status = _cmar_save_to_db(conn, report_date, result)
                 if status == "ALREADY_CONFIRMED":
                     stats["skipped"] += 1
