@@ -8593,21 +8593,48 @@ def _cmar_save_to_db(conn, report_date: str, result: dict) -> str:
         """, (report_date,))
         prev = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
 
+        # Trades: settled deals on report_date (net qty per symbol)
+        cur.execute("""
+            SELECT d.symbol, SUM(CASE WHEN d.action = 0 THEN d.qty ELSE -d.qty END)
+            FROM back_office.tab_deals d
+            WHERE d.settle_date_cash = %s AND d.status = 4
+              AND d.reason = 0 AND d.type_deal != 2
+            GROUP BY d.symbol
+        """, (report_date,))
+        trades_qty = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+
+        # CA/Cash bookings on report_date
+        cur.execute("""
+            SELECT currency, SUM(value_netto)
+            FROM back_office.tab_log_create_oper_bo WHERE value_date = %s GROUP BY currency
+        """, (report_date,))
+        ca_by_ccy = {r[0]: float(r[1] or 0) for r in cur.fetchall() if r[0]}
+        cur.execute("""
+            SELECT symbol, SUM(nominal)
+            FROM back_office.tab_log_create_oper_bo WHERE value_date = %s GROUP BY symbol
+        """, (report_date,))
+        ca_by_isin = {r[0]: float(r[1] or 0) for r in cur.fetchall() if r[0]}
+
         reconc = result.get("reconc_summary", [])
         if reconc:
+            def _row(r):
+                sym = r.get("symbol", "")
+                ext = float(r.get("external") or 0)
+                ext_prev = prev.get(sym)
+                day_chg = (ext - ext_prev) if sym in prev else None
+                is_ccy = len(sym) <= 4
+                trades = trades_qty.get(sym) or None
+                ca = (ca_by_ccy.get(sym) if is_ccy else ca_by_isin.get(sym)) or None
+                final = (day_chg - (trades or 0) - (ca or 0)) if day_chg is not None else None
+                return (report_date, sym, ext or None, r.get("inventory") or None,
+                        r.get("diff") or None, r.get("status", ""),
+                        ext_prev, day_chg, trades, ca, final)
             execute_values(cur, """
                 INSERT INTO back_office_auto.tab_cmar_reconc
                 (report_date, symbol, external_sum, inventory_sum, diff, status,
                  external_prev, day_change, trades_settled, ca_cash, final_diff)
                 VALUES %s
-            """, [(
-                report_date, r.get("symbol",""), r.get("external") or None,
-                r.get("inventory") or None, r.get("diff") or None, r.get("status",""),
-                prev.get(r.get("symbol","")),
-                (float(r.get("external") or 0) - prev.get(r.get("symbol",""), 0))
-                    if r.get("symbol","") in prev else None,
-                None, None, None,
-            ) for r in reconc])
+            """, [_row(r) for r in reconc])
 
         # Failed trades
         ft = result.get("failed_trades", [])
