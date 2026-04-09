@@ -8231,3 +8231,445 @@ def _process_cmf_message(
         processing_run_id=processing_run_id,
     )
     return ("PARSED", 1)
+
+
+# =============================================================================
+# CMAR — Client Money and Assets Reconciliation email parser
+# Timer: every 5 min  (NCRONTAB: 0 */5 * * * *)
+# Searches back.office@amwealth.ae inbox for:
+#   Subject: "AMWL - DD.MM.YYYY - Client Money and Assets Reconciled"
+#   Sender:  shirley.vincent@gtnme.com (or any @amwealth.ae / @gtnme.com)
+# Parses all attachments, saves to back_office_auto.tab_cmar_* tables.
+# Skips dates that are already "confirmed" in tab_cmar_runs.
+# =============================================================================
+
+CMAR_SUBJECT_KEYWORD = "client money and assets reconcil"
+CMAR_LOOKBACK_HOURS  = int(os.environ.get("CMAR_LOOKBACK_HOURS", "48"))
+
+
+def _cmar_extract_date_from_subject(subject: str) -> Optional[str]:
+    """Extract ISO date from 'AMWL - 08.04.2026 - Client Money and Assets Reconciled'."""
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", subject or "")
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    return None
+
+
+def _cmar_parse_attachment(fname: str, data: bytes) -> dict:
+    """Parse one CMAR attachment. Returns dict with keys matching tab_cmar_* schema."""
+    import csv as _csv
+    fname_lower = fname.lower()
+    out = {
+        "external_positions": [], "inventory_positions": [], "reconc_summary": [],
+        "gtn_fund_holdings": [], "gtn_settled_holdings": [], "cash_balances": [],
+        "cmf_orders": [], "repo_data": [], "stonex_balance": [],
+        "vision_bank": [], "portfolio_holdings": [], "bank_balances": [],
+    }
+
+    try:
+        # ── CSV ──────────────────────────────────────────────────────────────
+        if fname_lower.endswith(".csv"):
+            text = data.decode("utf-8-sig", errors="replace")
+            reader = _csv.DictReader(io.StringIO(text))
+            rows = [dict(r) for r in reader]
+
+            if "gtn_fund_holdings" in fname_lower or "fund_holdings" in fname_lower:
+                out["gtn_fund_holdings"] = [{
+                    "isin": r.get("ISIN_CODE", ""), "symbol": r.get("SYMBOL_CODE", ""),
+                    "name": r.get("SYMBOL_NAME", ""), "units": r.get("NUMBER_OF_UNITS", ""),
+                    "nav": r.get("NAV", ""), "market_value": r.get("CURRENT_INVESTMENT_VALUE", ""),
+                    "currency": r.get("CURRENCY", ""), "date": r.get("LAST_UPDATED_DATE", ""),
+                } for r in rows]
+
+            elif "settled_holding" in fname_lower or "gtn_settled" in fname_lower:
+                out["gtn_settled_holdings"] = [{
+                    "isin": r.get("ISIN_CODE", ""), "symbol": r.get("SYMBOL", ""),
+                    "exchange": r.get("EXCHANGE", ""), "qty": r.get("NET_HOLDINGS", ""),
+                    "available_qty": r.get("AVAILABLEQTY", ""), "avg_price": r.get("AVG_PRICE", ""),
+                    "market_price": r.get("MARKET_PRICE", ""), "market_value": r.get("MARKET_VALUE", ""),
+                    "unrealised_gl": r.get("UNREALIZE_GAIN_LOSS", ""),
+                    "currency": r.get("SYMBOL_CURRENCY", ""),
+                    "holding_type": r.get("HOLDING_TYPE", ""), "date": r.get("AS_OF_DATE", ""),
+                } for r in rows]
+
+            elif "settled_cash" in fname_lower or "cash_balance" in fname_lower:
+                out["cash_balances"] = [{
+                    "account": r.get("CASH_ACCOUNT_NO", ""), "currency": r.get("CURRENCY", ""),
+                    "total_balance": r.get("TOTAL_BALANCE", ""), "available": r.get("AVAILABLE_AMOUNT", ""),
+                    "blocked": r.get("BLOCKED_AMOUNT", ""), "unsettled": r.get("UNSETTLED_CASH", ""),
+                    "date": r.get("AS_OF_DATE", ""),
+                } for r in rows if float(r.get("TOTAL_BALANCE") or 0) != 0]
+
+        # ── XLSX ─────────────────────────────────────────────────────────────
+        elif fname_lower.endswith(".xlsx") or fname_lower.endswith(".xls"):
+            wb = load_workbook(io.BytesIO(data), data_only=True)
+
+            if "cmf_orders" in fname_lower:
+                ws = wb.active
+                headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+                out["cmf_orders"] = [
+                    dict(zip(headers, [str(v) if v is not None else "" for v in row]))
+                    for row in ws.iter_rows(min_row=2, values_only=True)
+                    if any(v is not None for v in row)
+                ]
+
+            elif "repo" in fname_lower and "report" not in fname_lower:
+                ws = wb.active
+                out["repo_data"] = [{
+                    "id": str(row[0] or ""), "deal": str(row[1] or ""),
+                    "direction": str(row[2] or ""), "symbol": str(row[3] or ""),
+                    "amount": str(row[4] or ""), "currency": str(row[5] or ""),
+                    "login": str(row[6] or ""),
+                    "trade_date": str(row[7])[:10] if row[7] else "",
+                    "value_date": str(row[8])[:10] if row[8] else "",
+                    "settle_date": str(row[10])[:10] if len(row) > 10 and row[10] else "",
+                    "rate": str(row[14] or "") if len(row) > 14 else "",
+                    "status": str(row[16] or "") if len(row) > 16 else "",
+                } for row in ws.iter_rows(min_row=2, values_only=True) if any(v is not None for v in row)]
+
+            elif "rec internal" in fname_lower or "internal vs external" in fname_lower or "internal_vs_external" in fname_lower:
+                if "RECONC" in wb.sheetnames:
+                    ws_r = wb["RECONC"]
+                    out["reconc_summary"] = [{
+                        "symbol": str(row[0] or ""), "external": row[1],
+                        "inventory": row[2], "diff": row[3], "status": str(row[4] or ""),
+                    } for row in ws_r.iter_rows(min_row=2, values_only=True) if row[0] is not None]
+                if "EXTERNAL" in wb.sheetnames:
+                    ws_e = wb["EXTERNAL"]
+                    out["external_positions"] = [{
+                        "date": str(row[1])[:10] if row[1] else "",
+                        "gl_account": str(row[2] or ""), "account_no": str(row[3] or ""),
+                        "type": str(row[4] or ""), "class": str(row[5] or ""),
+                        "name": str(row[6] or ""), "symbol": str(row[7] or ""),
+                        "nominal": row[8], "custodian": row[9],
+                        "difference": row[10], "status": str(row[11] or ""),
+                    } for row in ws_e.iter_rows(min_row=2, values_only=True) if row[1] is not None]
+                if "INVENTORY" in wb.sheetnames:
+                    ws_i = wb["INVENTORY"]
+                    out["inventory_positions"] = [{
+                        "date": str(row[1])[:10] if row[1] else "",
+                        "login": str(row[2] or ""), "name": str(row[3] or ""),
+                        "class": str(row[4] or ""), "symbol": str(row[6] or ""),
+                        "bo_position": row[7],
+                    } for row in ws_i.iter_rows(min_row=2, values_only=True) if row[1] is not None]
+
+            elif "reconciliation external" in fname_lower:
+                ws = wb.active
+                out["external_positions"] = [{
+                    "date": str(row[1])[:10] if row[1] else "",
+                    "gl_account": str(row[2] or ""), "account_no": str(row[3] or ""),
+                    "type": str(row[4] or ""), "class": str(row[5] or ""),
+                    "name": str(row[6] or ""), "symbol": str(row[7] or ""),
+                    "nominal": row[8], "custodian": row[9],
+                    "difference": row[10], "status": str(row[11] or ""),
+                } for row in ws.iter_rows(min_row=2, values_only=True) if row[1] is not None]
+
+            elif "reconciliation inventory" in fname_lower:
+                ws = wb.active
+                out["inventory_positions"] = [{
+                    "date": str(row[1])[:10] if row[1] else "",
+                    "login": str(row[2] or ""), "name": str(row[3] or ""),
+                    "class": str(row[4] or ""), "symbol": str(row[6] or ""),
+                    "bo_position": row[7],
+                } for row in ws.iter_rows(min_row=2, values_only=True) if row[1] is not None]
+
+            elif "interval" in fname_lower:
+                rows_out = []
+                for sh in wb.sheetnames:
+                    ws = wb[sh]
+                    for row in ws.iter_rows(min_row=1, max_row=30, values_only=True):
+                        if row[0] is not None and row[1] is not None:
+                            rows_out.append({"sheet": sh, "key": str(row[0]), "value": str(row[1])})
+                out["stonex_balance"] = rows_out
+
+            elif "vision bank" in fname_lower or "vision_bank" in fname_lower:
+                ws = wb.active
+                headers = None
+                rows_out = []
+                for row in ws.iter_rows(min_row=1, max_row=500, values_only=True):
+                    if headers is None:
+                        if any(v is not None for v in row):
+                            headers = [str(v) if v is not None else f"col{i}" for i, v in enumerate(row)]
+                    else:
+                        if any(v is not None for v in row):
+                            rows_out.append(dict(zip(headers, [str(v) if v is not None else "" for v in row])))
+                out["vision_bank"] = rows_out
+
+            elif "portfolio holdings" in fname_lower or "portfolio_holdings" in fname_lower:
+                ws = wb.active
+                headers = [str(c.value) if c.value else f"col{i}" for i, c in enumerate(next(ws.iter_rows(min_row=1, max_row=1)))]
+                out["portfolio_holdings"] = [
+                    dict(zip(headers, [str(v) if v is not None else "" for v in row]))
+                    for row in ws.iter_rows(min_row=2, max_row=500, values_only=True)
+                    if any(v is not None for v in row)
+                ][:100]
+
+        # ── PDF — log only, no auto-parse yet ────────────────────────────────
+        elif fname_lower.endswith(".pdf"):
+            logging.warning("CMAR_PARSER: PDF attachment '%s' — skipped (manual entry required)", fname)
+
+    except Exception as ex:
+        logging.exception("CMAR_PARSER: error parsing '%s': %s", fname, ex)
+
+    return out
+
+
+def _cmar_merge_results(parts: List[dict]) -> dict:
+    """Merge parsed results from multiple attachments into one dict."""
+    merged = {
+        "external_positions": [], "inventory_positions": [], "reconc_summary": [],
+        "gtn_fund_holdings": [], "gtn_settled_holdings": [], "cash_balances": [],
+        "cmf_orders": [], "repo_data": [], "stonex_balance": [],
+        "vision_bank": [], "portfolio_holdings": [], "bank_balances": [],
+        "_enbd": {"client_money": None, "custody": None},
+        "failed_trades": [],
+    }
+    for p in parts:
+        for key in ("external_positions", "inventory_positions", "reconc_summary",
+                    "gtn_fund_holdings", "gtn_settled_holdings", "cash_balances",
+                    "cmf_orders", "repo_data", "stonex_balance",
+                    "vision_bank", "portfolio_holdings", "bank_balances"):
+            merged[key].extend(p.get(key, []))
+    return merged
+
+
+def _cmar_save_to_db(conn, report_date: str, result: dict) -> str:
+    """Insert CMAR data into back_office_auto tables. Returns status string."""
+    from psycopg2.extras import execute_values
+
+    with conn.cursor() as cur:
+        # Upsert run (skip if already confirmed)
+        cur.execute("SELECT status FROM back_office_auto.tab_cmar_runs WHERE report_date = %s", (report_date,))
+        existing = cur.fetchone()
+        if existing and existing[0] == "confirmed":
+            logging.warning("CMAR_PARSER: %s already confirmed — skipping save", report_date)
+            return "ALREADY_CONFIRMED"
+
+        cur.execute("""
+            INSERT INTO back_office_auto.tab_cmar_runs (report_date, status)
+            VALUES (%s, 'pending')
+            ON CONFLICT (report_date) DO UPDATE SET updated_at = NOW()
+        """, (report_date,))
+
+        # Clear existing data
+        for tbl in ["tab_cmar_external", "tab_cmar_inventory", "tab_cmar_reconc",
+                    "tab_cmar_failed_trades", "tab_cmar_custodian_balances",
+                    "tab_cmar_cash", "tab_cmar_gtn_holdings"]:
+            cur.execute(f"DELETE FROM back_office_auto.{tbl} WHERE report_date = %s", (report_date,))
+
+        # External positions
+        ext = result.get("external_positions", [])
+        if ext:
+            execute_values(cur, """
+                INSERT INTO back_office_auto.tab_cmar_external
+                (report_date, gl_account_id, gl_account_number, gl_account_internal_type,
+                 class, sec_name, symbol, nominal, custodian_position, difference, status)
+                VALUES %s
+            """, [(report_date, r.get("gl_account",""), r.get("account_no",""), r.get("type",""),
+                   r.get("class",""), r.get("name",""), r.get("symbol",""),
+                   r.get("nominal") or None, r.get("custodian") or None,
+                   r.get("difference") or None, r.get("status","")) for r in ext])
+
+        # Inventory
+        inv = result.get("inventory_positions", [])
+        if inv:
+            execute_values(cur, """
+                INSERT INTO back_office_auto.tab_cmar_inventory
+                (report_date, login, name, class, sec_name, symbol, bo_position)
+                VALUES %s
+            """, [(report_date, r.get("login",""), r.get("name",""), r.get("class",""),
+                   r.get("name",""), r.get("symbol",""), r.get("bo_position") or None) for r in inv])
+
+        # Reconc + day-over-day
+        cur.execute("""
+            SELECT symbol, external_sum FROM back_office_auto.tab_cmar_reconc
+            WHERE report_date = (
+                SELECT MAX(report_date) FROM back_office_auto.tab_cmar_reconc WHERE report_date < %s
+            )
+        """, (report_date,))
+        prev = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
+
+        reconc = result.get("reconc_summary", [])
+        if reconc:
+            execute_values(cur, """
+                INSERT INTO back_office_auto.tab_cmar_reconc
+                (report_date, symbol, external_sum, inventory_sum, diff, status,
+                 external_prev, day_change, trades_settled, ca_cash, final_diff)
+                VALUES %s
+            """, [(
+                report_date, r.get("symbol",""), r.get("external") or None,
+                r.get("inventory") or None, r.get("diff") or None, r.get("status",""),
+                prev.get(r.get("symbol","")),
+                (float(r.get("external") or 0) - prev.get(r.get("symbol",""), 0))
+                    if r.get("symbol","") in prev else None,
+                None, None, None,
+            ) for r in reconc])
+
+        # Failed trades
+        ft = result.get("failed_trades", [])
+        if ft:
+            execute_values(cur, """
+                INSERT INTO back_office_auto.tab_cmar_failed_trades
+                (report_date, side, isin, quantity, currency, trade_date, settle_date,
+                 net_amount, counterparty, failing_reason)
+                VALUES %s
+            """, [(report_date, r.get("side",""), r.get("isin",""), r.get("quantity") or None,
+                   r.get("currency",""), r.get("trade_date") or None, r.get("settle_date") or None,
+                   r.get("net_amount") or None, r.get("counterparty",""),
+                   r.get("failing_reason", r.get("description",""))) for r in ft])
+
+        # Custodian balances (ENBD)
+        enbd = result.get("_enbd", {})
+        cust_rows = []
+        if enbd.get("client_money"):
+            cust_rows.append((report_date, "ENBD_CM", "Client Money", "USD", enbd["client_money"], "cash", ""))
+        if enbd.get("custody"):
+            cust_rows.append((report_date, "ENBD_CUSTODY", "Custody", "USD", enbd["custody"], "securities", ""))
+        if cust_rows:
+            execute_values(cur, """
+                INSERT INTO back_office_auto.tab_cmar_custodian_balances
+                (report_date, custodian, account, currency, balance, balance_type, source_file)
+                VALUES %s
+            """, cust_rows)
+
+        # Cash balances
+        cash = result.get("cash_balances", [])
+        if cash:
+            execute_values(cur, """
+                INSERT INTO back_office_auto.tab_cmar_cash
+                (report_date, source, account, currency, total_balance, available, blocked, unsettled)
+                VALUES %s
+            """, [(report_date, "GTN", r.get("account",""), r.get("currency",""),
+                   r.get("total_balance") or None, r.get("available") or None,
+                   r.get("blocked") or None, r.get("unsettled") or None) for r in cash])
+
+        # GTN holdings
+        holdings = []
+        for r in result.get("gtn_fund_holdings", []):
+            holdings.append((report_date, "fund", r.get("isin",""), r.get("symbol",""),
+                             r.get("name",""), "", r.get("units") or None, None,
+                             r.get("nav") or None, r.get("market_value") or None, r.get("currency","")))
+        for r in result.get("gtn_settled_holdings", []):
+            holdings.append((report_date, "settled", r.get("isin",""), r.get("symbol",""),
+                             r.get("name",""), r.get("exchange",""), r.get("qty") or None,
+                             r.get("avg_price") or None, r.get("market_price") or None,
+                             r.get("market_value") or None, r.get("currency","")))
+        if holdings:
+            execute_values(cur, """
+                INSERT INTO back_office_auto.tab_cmar_gtn_holdings
+                (report_date, holding_type, isin, symbol, name, exchange, quantity,
+                 avg_price, market_price, market_value, currency)
+                VALUES %s
+            """, holdings)
+
+        # Determine status
+        has_mismatches = any(
+            (r.get("status","") or "").upper() != "MATCHED"
+            for r in reconc if r.get("symbol")
+        )
+        status = "has_mismatches" if has_mismatches else "pending"
+        cur.execute(
+            "UPDATE back_office_auto.tab_cmar_runs SET status=%s, updated_at=NOW() WHERE report_date=%s",
+            (status, report_date))
+
+    conn.commit()
+    return status
+
+
+def _cmar_run_parser(conn, token: str) -> dict:
+    """Core CMAR parsing logic — fetch emails, parse, save. Returns stats dict."""
+    since_dt = now_utc() - timedelta(hours=CMAR_LOOKBACK_HOURS)
+    stats = {"emails_found": 0, "dates_saved": 0, "skipped": 0, "errors": []}
+
+    for mailbox in GRAPH_MAILBOXES:
+        messages = list_recent_messages(token, mailbox, since_dt)
+        cmar_msgs = [
+            m for m in messages
+            if CMAR_SUBJECT_KEYWORD in (m.get("subject") or "").lower()
+            and m.get("hasAttachments") is True
+        ]
+        logging.warning("CMAR_PARSER: found %d CMAR emails in %s", len(cmar_msgs), mailbox)
+        stats["emails_found"] += len(cmar_msgs)
+
+        for msg in cmar_msgs:
+            subject  = msg.get("subject", "")
+            msg_id   = msg.get("id")
+            report_date = _cmar_extract_date_from_subject(subject)
+            if not report_date:
+                logging.warning("CMAR_PARSER: could not extract date from subject: %r", subject)
+                stats["errors"].append(f"No date in: {subject}")
+                continue
+
+            try:
+                attachments = get_message_attachments(token, mailbox, msg_id)
+                parts = []
+                for att in attachments:
+                    att_id   = att.get("id")
+                    att_name = att.get("name", "")
+                    if not att_id or att.get("@odata.type","") == "#microsoft.graph.itemAttachment":
+                        continue
+                    att_bytes = get_attachment_content_bytes(token, mailbox, msg_id, att_id)
+                    parsed = _cmar_parse_attachment(att_name, att_bytes)
+                    parts.append(parsed)
+                    logging.warning("CMAR_PARSER: parsed attachment '%s' for %s", att_name, report_date)
+
+                result = _cmar_merge_results(parts)
+                status = _cmar_save_to_db(conn, report_date, result)
+                if status == "ALREADY_CONFIRMED":
+                    stats["skipped"] += 1
+                else:
+                    stats["dates_saved"] += 1
+                    logging.warning("CMAR_PARSER: saved %s → status=%s", report_date, status)
+
+            except Exception as ex:
+                logging.exception("CMAR_PARSER: error processing email for %s: %s", report_date, ex)
+                stats["errors"].append(f"{report_date}: {ex}")
+
+    return stats
+
+
+# ── Timer trigger: every 5 minutes ────────────────────────────────────────
+@app.function_name(name="cmar_email_parser")
+@app.timer_trigger(schedule="0 */5 * * * *", arg_name="timer", run_on_startup=False, use_monitor=False)
+def cmar_email_parser(timer: func.TimerRequest) -> None:
+    conn = None
+    try:
+        conn = get_conn()
+        token = get_graph_token()
+        stats = _cmar_run_parser(conn, token)
+        logging.warning("CMAR_PARSER done: %s", stats)
+    except Exception as ex:
+        logging.exception("cmar_email_parser failed: %s", ex)
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+    finally:
+        if conn:
+            conn.close()
+
+
+# ── HTTP trigger for manual run / testing ─────────────────────────────────
+@app.function_name(name="run_cmar_parser")
+@app.route(route="run-cmar-parser", auth_level=func.AuthLevel.FUNCTION, methods=["POST"])
+def run_cmar_parser_http(req: func.HttpRequest) -> func.HttpResponse:
+    conn = None
+    try:
+        conn = get_conn()
+        token = get_graph_token()
+        stats = _cmar_run_parser(conn, token)
+        return func.HttpResponse(
+            json.dumps({"ok": True, **stats}),
+            mimetype="application/json", status_code=200,
+        )
+    except Exception as ex:
+        logging.exception("run_cmar_parser_http failed: %s", ex)
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        return func.HttpResponse(
+            json.dumps({"error": str(ex)}),
+            mimetype="application/json", status_code=500,
+        )
+    finally:
+        if conn:
+            conn.close()
