@@ -8597,8 +8597,8 @@ def _cmar_save_to_db(conn, report_date: str, result: dict) -> str:
         cur.execute("""
             SELECT d.symbol, SUM(CASE WHEN d.action = 0 THEN d.qty ELSE -d.qty END)
             FROM back_office.tab_deals d
-            WHERE d.settle_date_cash = %s AND d.status = 4
-              AND d.reason = 0 AND d.type_deal != 2
+            WHERE d.settle_date_cash::date = %s::date AND d.status = 4
+              AND d.reason = 0 AND (d.type_deal IS NULL OR d.type_deal != 2)
             GROUP BY d.symbol
         """, (report_date,))
         trades_qty = {r[0]: float(r[1] or 0) for r in cur.fetchall()}
