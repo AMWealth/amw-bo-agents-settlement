@@ -8328,12 +8328,33 @@ def _cmar_parse_attachment(fname: str, data: bytes) -> dict:
                 } for row in ws.iter_rows(min_row=2, values_only=True) if any(v is not None for v in row)]
 
             elif "rec internal" in fname_lower or "internal vs external" in fname_lower or "internal_vs_external" in fname_lower:
-                if "RECONC" in wb.sheetnames:
-                    ws_r = wb["RECONC"]
-                    out["reconc_summary"] = [{
-                        "symbol": str(row[0] or ""), "external": row[1],
-                        "inventory": row[2], "diff": row[3], "status": str(row[4] or ""),
-                    } for row in ws_r.iter_rows(min_row=2, values_only=True) if row[0] is not None]
+                from collections import defaultdict
+                # INVENTORY: 0=id,1=date,2=login,3=name,4=class,5=sec_name,6=symbol,
+                #            7=bo_today,8=bo_prev,9=diff,10=Trades,11=CA_cash,12=final
+                if "INVENTORY" in wb.sheetnames:
+                    ws_i = wb["INVENTORY"]
+                    inv_rows = [r for r in ws_i.iter_rows(min_row=2, values_only=True)
+                                if r[1] is not None and r[6] is not None]
+                    out["inventory_positions"] = [{
+                        "date": str(row[1])[:10] if row[1] else "",
+                        "login": str(row[2] or ""), "name": str(row[3] or ""),
+                        "class": str(row[4] or ""), "symbol": str(row[6] or ""),
+                        "bo_position": row[7],
+                        "bo_prev": row[8] if len(row) > 8 else None,
+                        "trades": row[10] if len(row) > 10 else None,
+                        "ca_cash": row[11] if len(row) > 11 else None,
+                        "final": row[12] if len(row) > 12 else None,
+                    } for row in inv_rows]
+                    sym_agg = defaultdict(lambda: {"trades": 0.0, "ca_cash": 0.0, "final": 0.0, "bo_prev": 0.0})
+                    for row in inv_rows:
+                        sym = str(row[6] or "")
+                        if not sym: continue
+                        sym_agg[sym]["trades"]  += float(row[10] or 0) if len(row) > 10 else 0
+                        sym_agg[sym]["ca_cash"] += float(row[11] or 0) if len(row) > 11 else 0
+                        sym_agg[sym]["final"]   += float(row[12] or 0) if len(row) > 12 else 0
+                        sym_agg[sym]["bo_prev"] += float(row[8]  or 0) if len(row) > 8  else 0
+                    out["_inv_agg"] = dict(sym_agg)
+
                 if "EXTERNAL" in wb.sheetnames:
                     ws_e = wb["EXTERNAL"]
                     out["external_positions"] = [{
@@ -8343,15 +8364,34 @@ def _cmar_parse_attachment(fname: str, data: bytes) -> dict:
                         "name": str(row[6] or ""), "symbol": str(row[7] or ""),
                         "nominal": row[8], "custodian": row[9],
                         "difference": row[10], "status": str(row[11] or ""),
+                        "custodian_prev": row[12] if len(row) > 12 else None,
+                        "day_change": row[13] if len(row) > 13 else None,
+                        "transactions": row[14] if len(row) > 14 else None,
                     } for row in ws_e.iter_rows(min_row=2, values_only=True) if row[1] is not None]
-                if "INVENTORY" in wb.sheetnames:
-                    ws_i = wb["INVENTORY"]
-                    out["inventory_positions"] = [{
-                        "date": str(row[1])[:10] if row[1] else "",
-                        "login": str(row[2] or ""), "name": str(row[3] or ""),
-                        "class": str(row[4] or ""), "symbol": str(row[6] or ""),
-                        "bo_position": row[7],
-                    } for row in ws_i.iter_rows(min_row=2, values_only=True) if row[1] is not None]
+
+                if "RECONC" in wb.sheetnames:
+                    ws_r = wb["RECONC"]
+                    inv_agg = out.get("_inv_agg", {})
+                    reconc_rows = []
+                    for row in ws_r.iter_rows(min_row=2, values_only=True):
+                        if row[0] is None: continue
+                        sym = str(row[0] or "")
+                        agg = inv_agg.get(sym, {})
+                        ext_today = float(row[1] or 0)
+                        ext_prev  = float(agg.get("bo_prev", 0) or 0)
+                        trades    = float(agg.get("trades", 0) or 0)
+                        ca_cash   = float(agg.get("ca_cash", 0) or 0)
+                        final     = float(agg.get("final", 0) or 0)
+                        reconc_rows.append({
+                            "symbol": sym, "external": row[1], "inventory": row[2],
+                            "diff": row[3], "status": str(row[4] or ""),
+                            "external_prev": ext_prev if ext_prev else None,
+                            "day_change": (ext_today - ext_prev) if ext_prev else None,
+                            "trades_settled": trades if trades else None,
+                            "ca_cash": ca_cash if ca_cash else None,
+                            "final_diff": final if final else None,
+                        })
+                    out["reconc_summary"] = reconc_rows
 
             elif "reconciliation external" in fname_lower:
                 ws = wb.active
