@@ -8542,11 +8542,25 @@ def _cmar_save_to_db(conn, report_date: str, result: dict) -> str:
     from psycopg2.extras import execute_values
 
     with conn.cursor() as cur:
-        # Upsert run (skip if already confirmed)
+        # Check if already confirmed — if so, only update failed_trades (not the main data)
         cur.execute("SELECT status FROM back_office_auto.tab_cmar_runs WHERE report_date = %s", (report_date,))
         existing = cur.fetchone()
         if existing and existing[0] == "confirmed":
-            logging.warning("CMAR_PARSER: %s already confirmed — skipping save", report_date)
+            ft = result.get("failed_trades", [])
+            if ft:
+                from psycopg2.extras import execute_values as _ev
+                cur.execute("DELETE FROM back_office_auto.tab_cmar_failed_trades WHERE report_date = %s", (report_date,))
+                _ev(cur, """
+                    INSERT INTO back_office_auto.tab_cmar_failed_trades
+                    (report_date, side, isin, quantity, currency, trade_date, settle_date,
+                     net_amount, counterparty, failing_reason)
+                    VALUES %s
+                """, [(report_date, r.get("side",""), r.get("isin",""), r.get("quantity") or None,
+                       r.get("currency",""), r.get("trade_date") or None, r.get("settle_date") or None,
+                       r.get("net_amount") or None, r.get("counterparty",""),
+                       r.get("failing_reason", r.get("description",""))) for r in ft])
+                conn.commit()
+                logging.warning("CMAR_PARSER: %s confirmed — updated %d failed trades only", report_date, len(ft))
             return "ALREADY_CONFIRMED"
 
         cur.execute("""
