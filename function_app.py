@@ -6656,9 +6656,10 @@ def run_settlement_reconciliation(
             detail_rows.append(_detail_row(st, "MATCHED", td=td))
             continue
 
-        # Only try aggregate match if exact match found NO candidate at all.
-        # If td is not None, we already have a candidate — go to PARTIAL with mismatch notes.
-        rows, agg_status, agg_note = (None, None, None) if td is not None else try_aggregate_match(st, strict_candidates)
+        # Try aggregate match regardless of whether a single candidate was found.
+        # Case: external confo has netted qty (e.g. 1357 = 557+800) but we matched
+        # only one internal deal (800) → must check if sum of all candidates = ext qty.
+        rows, agg_status, agg_note = try_aggregate_match(st, strict_candidates)
         if rows is not None and agg_status is not None:
             matched_aggregated_count += 1
             internal_ids = ",".join([str(r["id"]) for r in rows])
