@@ -7889,220 +7889,240 @@ def _parse_date_cmf(s: str) -> Optional[str]:
     return None
 
 
-def parse_cmf_email(body_text: str) -> Optional[Dict[str, Any]]:
-    """Parse CMF email body text and return structured data."""
+def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
+    """Parse CMF email body — returns LIST of trade dicts (one per counterparty/ISIN block).
+
+    Handles two formats in one email:
+    - StoneX netting block: 'Below trades VS : StoneX – fully closed' +
+      'Netting Instruction' table with FAMT Close / Interest / Wired In
+    - FAB individual deals: 'Below Trades VS : FAB – fully closed' +
+      per-deal blocks 'AM Wealth enters Reverse Repo...' with ISIN / Face Amount /
+      Settlement Cash / Trade Date / Settlement Date
+    """
     import re as _re
 
     text = body_text
     upper = text.upper()
 
-    # Skip "No CMF movements" emails
     if 'NO CMF MOVEMENT' in upper:
-        return None
+        return []
 
-    result = {
-        'email_type': None,
-        'counterparty': None,
-        'isin': None,
-        'famt_close': None,
-        'famt_reopen': None,
-        'amount_close': None,
-        'amount_reopen': None,
-        'interest': None,
-        'net_amount': None,
-        'net_nominal': None,
-        'rate': None,
-        'currency': 'USD',
-        'trade_date': None,
-        'settlement_date': None,
-        'ssi': None,
-    }
+    def _blank():
+        return {
+            'email_type': None, 'counterparty': None, 'isin': None,
+            'famt_close': None, 'famt_reopen': None,
+            'amount_close': None, 'amount_reopen': None,
+            'interest': None, 'net_amount': None, 'net_nominal': None,
+            'rate': None, 'currency': 'USD',
+            'trade_date': None, 'settlement_date': None, 'ssi': None,
+        }
 
-    # --- Counterparty ---
-    m = _re.search(r'(?:Trade\s+)?VS\s*:\s*(\w[\w\s]*?)(?:\s*[-\u2013\u2014]|\s*$)', text, _re.IGNORECASE | _re.MULTILINE)
-    if m:
-        result['counterparty'] = m.group(1).strip()
+    results: List[Dict[str, Any]] = []
 
-    # --- SSI / E/C ---
-    m = _re.search(r'(?:E/C|EC|FAB\s+SSI)\s*[:\s]*(\d{4,6})', text, _re.IGNORECASE)
-    if m:
-        result['ssi'] = 'E/C ' + m.group(1)
+    # ── Split email into per-counterparty sections ────────────────────────────
+    # Pattern: "Below trades VS : <Counterparty> – fully closed" or similar
+    section_pattern = _re.compile(
+        r'Below\s+[Tt]rades?\s+VS\s*:\s*(\w[\w\s]*?)(?:\s*[-\u2013\u2014].*?$)',
+        _re.MULTILINE
+    )
+    section_matches = list(section_pattern.finditer(text))
 
-    # --- Detect email type ---
-    has_closing = bool(_re.search(r'Closing\s+Deal', text, _re.IGNORECASE))
-    has_reopen = bool(_re.search(r'Reopen\s+New\s+Deal', text, _re.IGNORECASE))
-    has_fully = 'FULLY CLOSED' in upper
-    has_new_trade = bool(_re.search(r'New\s+trade\s+opened', text, _re.IGNORECASE))
-    has_new_repo = bool(_re.search(r'(?:opened|details\s+of)\s+(?:rev(?:erse)?\s+)?repo', text, _re.IGNORECASE))
-
-    if has_closing and has_reopen:
-        result['email_type'] = 'partial_close'
-    elif has_closing or has_fully:
-        result['email_type'] = 'fully_closed'
-    elif has_new_trade or has_new_repo:
-        result['email_type'] = 'new_trade'
+    if not section_matches:
+        # Fallback: treat whole email as one section (legacy single-counterparty format)
+        section_matches_fallback = True
+        sections = [('', text)]
     else:
-        if _re.search(r'ISIN\s*:', text):
-            result['email_type'] = 'new_trade'
+        section_matches_fallback = False
+        sections = []
+        for i, m in enumerate(section_matches):
+            cpty = m.group(1).strip()
+            start = m.start()
+            end = section_matches[i + 1].start() if i + 1 < len(section_matches) else len(text)
+            sections.append((cpty, text[start:end]))
+
+    for cpty_name, section_text in sections:
+        section_upper = section_text.upper()
+
+        # --- Detect email type for this section ---
+        has_closing = bool(_re.search(r'Closing\s+Deal', section_text, _re.IGNORECASE))
+        has_reopen  = bool(_re.search(r'Reopen\s+New\s+Deal', section_text, _re.IGNORECASE))
+        has_fully   = 'FULLY CLOSED' in section_upper
+        has_new     = bool(_re.search(r'New\s+trade\s+opened|(?:opened|details\s+of)\s+(?:rev(?:erse)?\s+)?repo', section_text, _re.IGNORECASE))
+
+        if has_closing and has_reopen:
+            email_type = 'partial_close'
+        elif has_closing or has_fully:
+            email_type = 'fully_closed'
+        elif has_new or _re.search(r'ISIN\s*:', section_text):
+            email_type = 'new_trade'
         else:
-            return None
+            continue
 
-    # --- Parse ISIN ---
-    m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', text)
-    if m:
-        result['isin'] = m.group(1)
+        # --- Counterparty (from section header or fallback from text) ---
+        if not cpty_name:
+            m = _re.search(r'(?:Trade\s+)?VS\s*:\s*(\w[\w\s]*?)(?:\s*[-\u2013\u2014]|\s*$)',
+                           section_text, _re.IGNORECASE | _re.MULTILINE)
+            cpty_name = m.group(1).strip() if m else ''
 
-    # --- Parse Rate ---
-    m = _re.search(r'Rate\s*:\s*([\d.]+)', text, _re.IGNORECASE)
-    if not m:
-        m = _re.search(r'Repo\s+Rate\s*:\s*([\d.]+)', text, _re.IGNORECASE)
-    if m:
-        result['rate'] = float(m.group(1))
-
-    # --- Parse Currency ---
-    m = _re.search(r'Currency\s*:\s*([A-Z]{3})', text, _re.IGNORECASE)
-    if m:
-        result['currency'] = m.group(1).upper()
-
-    if result['email_type'] == 'new_trade':
-        # FAMT
-        m = _re.search(r'FAMT\s*:\s*([\d,.\s]+)', text)
+        # --- SSI ---
+        ssi = None
+        m = _re.search(r'(?:E/C|EC|FAB\s+SSI)\s*[:\s]*(\d{4,6})', section_text, _re.IGNORECASE)
         if m:
-            result['famt_close'] = _parse_number(m.group(1))
-            result['net_nominal'] = result['famt_close']
+            ssi = 'E/C ' + m.group(1)
 
-        # Amount (Wired out)
-        m = _re.search(r'Wired\s+out\s*:\s*\$?([\d,.\s]+)', text, _re.IGNORECASE)
-        if not m:
-            m = _re.search(r'Wired\s+(?:Amt|Amount)\s*[.:]\s*\$?([\d,.\s]+)', text, _re.IGNORECASE)
-        if m:
-            result['amount_close'] = _parse_number(m.group(1))
-            result['net_amount'] = result['amount_close']
+        # ── FAB-style: individual "AM Wealth enters Reverse Repo" blocks ─────
+        fab_blocks = list(_re.finditer(
+            r'AM\s+Wealth\s+enters\s+(?:Reverse\s+)?Repo.*?(?=AM\s+Wealth\s+enters|$)',
+            section_text, _re.IGNORECASE | _re.DOTALL
+        ))
+        if fab_blocks:
+            for blk_m in fab_blocks:
+                blk = blk_m.group(0)
+                r = _blank()
+                r['email_type'] = email_type
+                r['counterparty'] = cpty_name
+                r['ssi'] = ssi
 
-        # Cash field (e.g. "Cash: USD 854,352.00")
-        if not result['amount_close']:
-            m = _re.search(r'Cash\s*:\s*(?:USD\s*)?\$?([\d,.\s]+)', text, _re.IGNORECASE)
-            if m:
-                result['amount_close'] = _parse_number(m.group(1))
-                result['net_amount'] = result['amount_close']
+                m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', blk)
+                if m: r['isin'] = m.group(1)
 
-        # Trade Date
-        m = _re.search(r'TD\s*:\s*([\d/]+)', text)
-        if not m:
-            m = _re.search(r'Trade\s+Date\s*:\s*([\d/.-]+)', text, _re.IGNORECASE)
-        if m:
-            result['trade_date'] = _parse_date_cmf(m.group(1))
-
-        # Settlement Date
-        m = _re.search(r'SD\s*:\s*([\d/]+)', text)
-        if not m:
-            m = _re.search(r'Settlement\s+Date\s*:\s*([\d/.-]+)', text, _re.IGNORECASE)
-        if m:
-            result['settlement_date'] = _parse_date_cmf(m.group(1))
-
-        # Face Amount from structured field
-        if not result['famt_close']:
-            m = _re.search(r'Face\s+Amount\s*:\s*([\d,.\s]+)', text, _re.IGNORECASE)
-            if m:
-                result['famt_close'] = _parse_number(m.group(1))
-                result['net_nominal'] = result['famt_close']
-
-    elif result['email_type'] in ('partial_close', 'fully_closed'):
-        # --- Netting Instruction block ---
-        ni_block = _re.search(
-            r'Netting\s+Instruction[:\s]*(.*?)(?:Kind\s+regards|$)',
-            text, _re.IGNORECASE | _re.DOTALL
-        )
-        ni_text = ni_block.group(1) if ni_block else text
-
-        # ISIN from netting block
-        m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', ni_text)
-        if m:
-            result['isin'] = m.group(1)
-
-        # FAMT Close
-        m = _re.search(r'FAMT\s+Close\s*:?\s*([\d,.\s]+)', ni_text, _re.IGNORECASE)
-        if m:
-            result['famt_close'] = _parse_number(m.group(1))
-
-        # Interest
-        m = _re.search(r'Interest\s*:?\s*\$?\s*([\d,.\s]+)', ni_text, _re.IGNORECASE)
-        if m:
-            result['interest'] = _parse_number(m.group(1))
-
-        # Wired In (net amount for close)
-        m = _re.search(r'Wired\s+In\s*:?\s*\$?\s*([\d,.\s]+)', ni_text, _re.IGNORECASE)
-        if m:
-            result['net_amount'] = _parse_number(m.group(1))
-
-        # Trade date from netting
-        m = _re.search(r'Trade\s+date\s*:?\s*([\d/.-]+)', ni_text, _re.IGNORECASE)
-        if m:
-            result['trade_date'] = _parse_date_cmf(m.group(1))
-
-        # Settlement date (SD)
-        m = _re.search(r'SD\s*:?\s*([\d/.-]+)', ni_text)
-        if not m:
-            m = _re.search(r'Settlement\s+Date\s*:?\s*([\d/.-]+)', ni_text, _re.IGNORECASE)
-        if m:
-            result['settlement_date'] = _parse_date_cmf(m.group(1))
-
-        # --- Closing Deal table: get amount + interest ---
-        close_block = _re.search(
-            r'Closing\s+Deal[:\s]*(.*?)(?:Reopen|Netting|Kind\s+regards|$)',
-            text, _re.IGNORECASE | _re.DOTALL
-        )
-        if close_block:
-            cb = close_block.group(1)
-            m = _re.search(r'Amount\s*[:\s]*\$?\s*([\d,.\s]+)', cb, _re.IGNORECASE)
-            if m:
-                result['amount_close'] = _parse_number(m.group(1))
-            m = _re.search(r'Net\s+wired\s+amount\s*[:\s]*([\d,.\s]+)', cb, _re.IGNORECASE)
-            if m:
-                nwa = _parse_number(m.group(1))
-                if nwa and not result['net_amount']:
-                    result['net_amount'] = nwa
-            if not result['interest']:
-                m = _re.search(r'Interest\s*[:\s]*([\d,.\s]+)', cb, _re.IGNORECASE)
+                m = _re.search(r'Face\s+Amount\s*:\s*([\d,.\s]+)', blk, _re.IGNORECASE)
                 if m:
-                    result['interest'] = _parse_number(m.group(1))
-            if not result['famt_close']:
-                m = _re.search(r'FAMT\s*[:\s]*([\d,.\s]+)', cb, _re.IGNORECASE)
-                if m:
-                    result['famt_close'] = _parse_number(m.group(1))
+                    r['famt_close'] = _parse_number(m.group(1))
+                    r['net_nominal'] = r['famt_close']
 
-        # --- Reopen New Deal table ---
-        if result['email_type'] == 'partial_close':
-            reopen_block = _re.search(
-                r'Reopen\s+New\s+Deal[:\s]*(.*?)(?:Netting|Kind\s+regards|$)',
-                text, _re.IGNORECASE | _re.DOTALL
-            )
-            if reopen_block:
-                rb = reopen_block.group(1)
-                m = _re.search(r'Amount\s*[:\s]*\$?\s*([\d,.\s]+)', rb, _re.IGNORECASE)
+                # Settlement Cash = principal + interest (what gets wired)
+                m = _re.search(r'Settlement\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
                 if m:
-                    result['amount_reopen'] = _parse_number(m.group(1))
-                m = _re.search(r'FAMT\s+left\s*[:\s]*([\d,.\s]+)', rb, _re.IGNORECASE)
+                    r['net_amount'] = _parse_number(m.group(1))
+                    r['amount_close'] = r['net_amount']
+
+                m = _re.search(r'Interest\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
+                if m: r['interest'] = _parse_number(m.group(1))
+
+                m = _re.search(r'(?:All\s+in\s+Price|All\s+in\s+price)\s*:\s*([\d,.]+)', blk, _re.IGNORECASE)
+                if m: r['rate'] = float(m.group(1).replace(',', ''))
+
+                m = _re.search(r'Trade\s+Date\s*:\s*([\d/.\-\w]+)', blk, _re.IGNORECASE)
+                if m: r['trade_date'] = _parse_date_cmf(m.group(1))
+
+                m = _re.search(r'Settlement\s+Date\s*:\s*([\d/.\-\w]+)', blk, _re.IGNORECASE)
+                if m: r['settlement_date'] = _parse_date_cmf(m.group(1))
+
+                if r['isin']:
+                    results.append(r)
+            continue
+
+        # ── StoneX-style: Netting Instruction blocks (one per deal) ──────────
+        ni_blocks = list(_re.finditer(
+            r'Netting\s+Instruction[:\s]*(.*?)(?=Netting\s+Instruction|Kind\s+regards|@Back\s+Office|Netting\s+US|$)',
+            section_text, _re.IGNORECASE | _re.DOTALL
+        ))
+
+        if ni_blocks:
+            for ni_m in ni_blocks:
+                ni = ni_m.group(1)
+                r = _blank()
+                r['email_type'] = email_type
+                r['counterparty'] = cpty_name
+                r['ssi'] = ssi
+
+                m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', ni)
+                if m: r['isin'] = m.group(1)
+
+                m = _re.search(r'FAMT\s+Close\s*:?\s*([\d,.\s]+)', ni, _re.IGNORECASE)
+                if m:
+                    r['famt_close'] = _parse_number(m.group(1))
+
+                m = _re.search(r'Interest\s*:?\s*\$?\s*([\d,.\s]+)', ni, _re.IGNORECASE)
+                if m: r['interest'] = _parse_number(m.group(1))
+
+                m = _re.search(r'Wired\s+In\s*:?\s*\$?\s*([\d,.\s]+)', ni, _re.IGNORECASE)
+                if m: r['net_amount'] = _parse_number(m.group(1))
+
+                m = _re.search(r'Trade\s+date\s*:?\s*([\d/.\-]+)', ni, _re.IGNORECASE)
+                if m: r['trade_date'] = _parse_date_cmf(m.group(1))
+
+                m = _re.search(r'SD\s*:?\s*([\d/.\-]+)', ni)
                 if not m:
-                    m = _re.search(r'FAMT\s*[:\s]*([\d,.\s]+)', rb, _re.IGNORECASE)
+                    m = _re.search(r'Settlement\s+Date\s*:?\s*([\d/.\-]+)', ni, _re.IGNORECASE)
+                if m: r['settlement_date'] = _parse_date_cmf(m.group(1))
+
+                if r['famt_close']:
+                    r['net_nominal'] = r['famt_close']
+                if not r['net_amount'] and r.get('amount_close'):
+                    r['net_amount'] = (r['amount_close'] or 0) + (r['interest'] or 0)
+
+                if r['isin']:
+                    results.append(r)
+
+            # Also parse the summary netting line at bottom of StoneX section
+            # "Netting US91282CHJ36: FAMT : 5,685,000  Interest : $10,244.96  Wired in : $5,692,244.96  SD 4/10/2026"
+            summary = _re.search(
+                r'Netting\s+([A-Z]{2}[A-Z0-9]{9,10})\s*:(.*?)(?=Kind\s+regards|$)',
+                section_text, _re.IGNORECASE | _re.DOTALL
+            )
+            if summary:
+                isin_s = summary.group(1)
+                sb = summary.group(2)
+                r = _blank()
+                r['email_type'] = email_type
+                r['counterparty'] = cpty_name + '_NET'
+                r['isin'] = isin_s
+                r['ssi'] = ssi
+
+                m = _re.search(r'FAMT\s*:\s*([\d,.\s]+)', sb, _re.IGNORECASE)
                 if m:
-                    result['famt_reopen'] = _parse_number(m.group(1))
+                    r['famt_close'] = _parse_number(m.group(1))
+                    r['net_nominal'] = r['famt_close']
 
-        # --- Compute net nominal ---
-        if result['famt_close'] and result.get('famt_reopen'):
-            result['net_nominal'] = result['famt_close'] - result['famt_reopen']
-        elif result['famt_close']:
-            result['net_nominal'] = result['famt_close']
+                m = _re.search(r'Interest\s*:\s*\$?([\d,.\s]+)', sb, _re.IGNORECASE)
+                if m: r['interest'] = _parse_number(m.group(1))
 
-        # --- Compute net amount if not from netting block ---
-        if not result['net_amount']:
-            ac = result.get('amount_close') or 0
-            interest = result.get('interest') or 0
-            ar = result.get('amount_reopen') or 0
-            if ac:
-                result['net_amount'] = ac + interest - ar
+                m = _re.search(r'Wired\s+in\s*:\s*\$?([\d,.\s]+)', sb, _re.IGNORECASE)
+                if m: r['net_amount'] = _parse_number(m.group(1))
 
-    return result
+                m = _re.search(r'SD\s+([\d/.\-]+)', sb)
+                if m: r['settlement_date'] = _parse_date_cmf(m.group(1))
+
+                if r['famt_close']:
+                    results.append(r)
+            continue
+
+        # ── Legacy single-block fallback ─────────────────────────────────────
+        r = _blank()
+        r['email_type'] = email_type
+        r['counterparty'] = cpty_name
+        r['ssi'] = ssi
+
+        m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', section_text)
+        if m: r['isin'] = m.group(1)
+
+        m = _re.search(r'Rate\s*:\s*([\d.]+)|Repo\s+Rate\s*:\s*([\d.]+)', section_text, _re.IGNORECASE)
+        if m: r['rate'] = float((m.group(1) or m.group(2)))
+
+        if email_type == 'new_trade':
+            m = _re.search(r'FAMT\s*:\s*([\d,.\s]+)|Face\s+Amount\s*:\s*([\d,.\s]+)', section_text, _re.IGNORECASE)
+            if m:
+                r['famt_close'] = _parse_number(m.group(1) or m.group(2))
+                r['net_nominal'] = r['famt_close']
+            for pat in [r'Wired\s+out\s*:\s*\$?([\d,.\s]+)',
+                        r'Settlement\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)',
+                        r'Cash\s*:\s*(?:USD\s*)?\$?([\d,.\s]+)']:
+                m = _re.search(pat, section_text, _re.IGNORECASE)
+                if m:
+                    r['amount_close'] = _parse_number(m.group(1))
+                    r['net_amount'] = r['amount_close']
+                    break
+            m = _re.search(r'Trade\s+Date\s*:\s*([\d/.\-\w]+)|TD\s*:\s*([\d/]+)', section_text, _re.IGNORECASE)
+            if m: r['trade_date'] = _parse_date_cmf(m.group(1) or m.group(2))
+            m = _re.search(r'Settlement\s+Date\s*:\s*([\d/.\-\w]+)|SD\s*:\s*([\d/]+)', section_text, _re.IGNORECASE)
+            if m: r['settlement_date'] = _parse_date_cmf(m.group(1) or m.group(2))
+
+        if r['isin']:
+            results.append(r)
+
+    return results
 
 
 def _process_cmf_message(
@@ -8121,11 +8141,12 @@ def _process_cmf_message(
     # (skip only if already in tab_cmf_parsed with non-pending status)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT status FROM back_office_auto.tab_cmf_parsed WHERE email_id = %s",
+            "SELECT COUNT(*), MIN(status) FROM back_office_auto.tab_cmf_parsed WHERE email_id = %s",
             (internet_message_id,)
         )
-        existing = cur.fetchone()
-        if existing and existing[0] not in ('pending', 'review_required'):
+        row = cur.fetchone()
+        # Skip only if ALL rows for this email are in a terminal non-pending state
+        if row and row[0] > 0 and row[1] not in ('pending', 'review_required'):
             return ("ALREADY_PROCESSED", 0)
 
     message_id = msg["id"]
@@ -8151,8 +8172,8 @@ def _process_cmf_message(
         processing_run_id=processing_run_id,
     )
 
-    parsed = parse_cmf_email(body_text)
-    if not parsed:
+    parsed_list = parse_cmf_email(body_text)
+    if not parsed_list:
         insert_settlement_email(
             conn=conn,
             internet_message_id=internet_message_id,
@@ -8169,55 +8190,56 @@ def _process_cmf_message(
         )
         return ("SKIPPED", 0)
 
-    # Insert into tab_cmf_parsed
+    # Insert each parsed trade into tab_cmf_parsed
     with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO back_office_auto.tab_cmf_parsed
-                (email_id, received_at, email_type, counterparty, isin,
-                 famt_close, famt_reopen, amount_close, amount_reopen,
-                 interest, net_amount, net_nominal, rate, currency,
-                 trade_date, settlement_date, ssi, status)
-            VALUES (%s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, 'pending')
-            ON CONFLICT (email_id) DO UPDATE SET
-                email_type = EXCLUDED.email_type,
-                counterparty = EXCLUDED.counterparty,
-                isin = EXCLUDED.isin,
-                famt_close = EXCLUDED.famt_close,
-                famt_reopen = EXCLUDED.famt_reopen,
-                amount_close = EXCLUDED.amount_close,
-                amount_reopen = EXCLUDED.amount_reopen,
-                interest = EXCLUDED.interest,
-                net_amount = EXCLUDED.net_amount,
-                net_nominal = EXCLUDED.net_nominal,
-                rate = EXCLUDED.rate,
-                currency = EXCLUDED.currency,
-                trade_date = EXCLUDED.trade_date,
-                settlement_date = EXCLUDED.settlement_date,
-                ssi = EXCLUDED.ssi
-        """, (
-            internet_message_id,
-            received_at,
-            parsed['email_type'],
-            parsed['counterparty'],
-            parsed['isin'],
-            parsed['famt_close'],
-            parsed['famt_reopen'],
-            parsed['amount_close'],
-            parsed['amount_reopen'],
-            parsed['interest'],
-            parsed['net_amount'],
-            parsed['net_nominal'],
-            parsed['rate'],
-            parsed['currency'],
-            parsed['trade_date'],
-            parsed['settlement_date'],
-            parsed['ssi'],
-        ))
+        for parsed in parsed_list:
+            cur.execute("""
+                INSERT INTO back_office_auto.tab_cmf_parsed
+                    (email_id, received_at, email_type, counterparty, isin,
+                     famt_close, famt_reopen, amount_close, amount_reopen,
+                     interest, net_amount, net_nominal, rate, currency,
+                     trade_date, settlement_date, ssi, status)
+                VALUES (%s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, 'pending')
+                ON CONFLICT (email_id, isin, counterparty) DO UPDATE SET
+                    email_type = EXCLUDED.email_type,
+                    famt_close = EXCLUDED.famt_close,
+                    famt_reopen = EXCLUDED.famt_reopen,
+                    amount_close = EXCLUDED.amount_close,
+                    amount_reopen = EXCLUDED.amount_reopen,
+                    interest = EXCLUDED.interest,
+                    net_amount = EXCLUDED.net_amount,
+                    net_nominal = EXCLUDED.net_nominal,
+                    rate = EXCLUDED.rate,
+                    currency = EXCLUDED.currency,
+                    trade_date = EXCLUDED.trade_date,
+                    settlement_date = EXCLUDED.settlement_date,
+                    ssi = EXCLUDED.ssi
+            """, (
+                internet_message_id,
+                received_at,
+                parsed['email_type'],
+                parsed['counterparty'],
+                parsed['isin'],
+                parsed['famt_close'],
+                parsed['famt_reopen'],
+                parsed['amount_close'],
+                parsed['amount_reopen'],
+                parsed['interest'],
+                parsed['net_amount'],
+                parsed['net_nominal'],
+                parsed['rate'],
+                parsed['currency'],
+                parsed['trade_date'],
+                parsed['settlement_date'],
+                parsed['ssi'],
+            ))
     conn.commit()
 
+    isins_note = ", ".join(p.get('isin') or '?' for p in parsed_list)
+    types_note = "/".join(sorted({p.get('email_type') or '?' for p in parsed_list}))
     insert_settlement_email(
         conn=conn,
         internet_message_id=internet_message_id,
@@ -8226,13 +8248,13 @@ def _process_cmf_message(
         subject=subject,
         received_at=received_at,
         status="PARSED",
-        note=f"CMF {parsed['email_type']}: {parsed.get('isin') or 'no ISIN'}",
+        note=f"CMF {types_note}: {len(parsed_list)} trade(s): {isins_note}",
         mailbox=mailbox,
         attachment_count=0,
-        parsed_trade_count=1,
+        parsed_trade_count=len(parsed_list),
         processing_run_id=processing_run_id,
     )
-    return ("PARSED", 1)
+    return ("PARSED", len(parsed_list))
 
 
 # =============================================================================
