@@ -8013,56 +8013,22 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
                     results.append(r)
             continue
 
-        # ── StoneX-style: Netting Instruction blocks (one per deal) ──────────
+        # ── StoneX-style: summary netting line takes priority over individual blocks ──
+        # "Netting US91282CHJ36: FAMT : 5,685,000  Interest : $10,244.96  Wired in : $5,692,244.96  SD 4/10/2026"
+        # When summary exists, use ONLY it (individual blocks are components, not settlement instructions)
+        summary = _re.search(
+            r'Netting\s+([A-Z]{2}[A-Z0-9]{9,10})\s*:(.*?)(?=Kind\s+regards|$)',
+            section_text, _re.DOTALL  # no IGNORECASE: ISIN is uppercase, "Instruction" is not
+        )
+
         ni_blocks = list(_re.finditer(
             r'Netting\s+Instruction[:\s]*(.*?)(?=Netting\s+Instruction|Kind\s+regards|@Back\s+Office|Netting\s+US|$)',
             section_text, _re.IGNORECASE | _re.DOTALL
         ))
 
         if ni_blocks:
-            for ni_m in ni_blocks:
-                ni = ni_m.group(1)
-                r = _blank()
-                r['email_type'] = email_type
-                r['counterparty'] = cpty_name
-                r['ssi'] = ssi
-
-                m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', ni)
-                if m: r['isin'] = m.group(1)
-
-                m = _re.search(r'FAMT\s+Close\s*:?\s*([\d,.\s]+)', ni, _re.IGNORECASE)
-                if m:
-                    r['famt_close'] = _parse_number(m.group(1))
-
-                m = _re.search(r'Interest\s*:?\s*\$?\s*([\d,.\s]+)', ni, _re.IGNORECASE)
-                if m: r['interest'] = _parse_number(m.group(1))
-
-                m = _re.search(r'Wired\s+In\s*:?\s*\$?\s*([\d,.\s]+)', ni, _re.IGNORECASE)
-                if m: r['net_amount'] = _parse_number(m.group(1))
-
-                m = _re.search(r'Trade\s+date\s*:?\s*([\d/.\-]+)', ni, _re.IGNORECASE)
-                if m: r['trade_date'] = _parse_date_cmf(m.group(1))
-
-                m = _re.search(r'SD\s*:?\s*([\d/.\-]+)', ni)
-                if not m:
-                    m = _re.search(r'Settlement\s+Date\s*:?\s*([\d/.\-]+)', ni, _re.IGNORECASE)
-                if m: r['settlement_date'] = _parse_date_cmf(m.group(1))
-
-                if r['famt_close']:
-                    r['net_nominal'] = r['famt_close']
-                if not r['net_amount'] and r.get('amount_close'):
-                    r['net_amount'] = (r['amount_close'] or 0) + (r['interest'] or 0)
-
-                if r['isin']:
-                    results.append(r)
-
-            # Also parse the summary netting line at bottom of StoneX section
-            # "Netting US91282CHJ36: FAMT : 5,685,000  Interest : $10,244.96  Wired in : $5,692,244.96  SD 4/10/2026"
-            summary = _re.search(
-                r'Netting\s+([A-Z]{2}[A-Z0-9]{9,10})\s*:(.*?)(?=Kind\s+regards|$)',
-                section_text, _re.DOTALL  # no IGNORECASE: ISIN is uppercase, "Instruction" is not
-            )
             if summary:
+                # Summary line = the actual net settlement instruction — use only this
                 isin_s = summary.group(1)
                 sb = summary.group(2)
                 r = _blank()
@@ -8087,6 +8053,43 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
 
                 if r['famt_close']:
                     results.append(r)
+            else:
+                # No summary — parse individual blocks (fallback for emails without summary line)
+                for ni_m in ni_blocks:
+                    ni = ni_m.group(1)
+                    r = _blank()
+                    r['email_type'] = email_type
+                    r['counterparty'] = cpty_name
+                    r['ssi'] = ssi
+
+                    m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', ni)
+                    if m: r['isin'] = m.group(1)
+
+                    m = _re.search(r'FAMT\s+Close\s*:?\s*([\d,.\s]+)', ni, _re.IGNORECASE)
+                    if m:
+                        r['famt_close'] = _parse_number(m.group(1))
+
+                    m = _re.search(r'Interest\s*:?\s*\$?\s*([\d,.\s]+)', ni, _re.IGNORECASE)
+                    if m: r['interest'] = _parse_number(m.group(1))
+
+                    m = _re.search(r'Wired\s+In\s*:?\s*\$?\s*([\d,.\s]+)', ni, _re.IGNORECASE)
+                    if m: r['net_amount'] = _parse_number(m.group(1))
+
+                    m = _re.search(r'Trade\s+date\s*:?\s*([\d/.\-]+)', ni, _re.IGNORECASE)
+                    if m: r['trade_date'] = _parse_date_cmf(m.group(1))
+
+                    m = _re.search(r'SD\s*:?\s*([\d/.\-]+)', ni)
+                    if not m:
+                        m = _re.search(r'Settlement\s+Date\s*:?\s*([\d/.\-]+)', ni, _re.IGNORECASE)
+                    if m: r['settlement_date'] = _parse_date_cmf(m.group(1))
+
+                    if r['famt_close']:
+                        r['net_nominal'] = r['famt_close']
+                    if not r['net_amount'] and r.get('amount_close'):
+                        r['net_amount'] = (r['amount_close'] or 0) + (r['interest'] or 0)
+
+                    if r['isin']:
+                        results.append(r)
             continue
 
         # ── Legacy single-block fallback ─────────────────────────────────────
