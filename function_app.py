@@ -7920,9 +7920,9 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
     # ── Split email into per-counterparty sections ────────────────────────────
-    # Pattern: "Below trades VS : <Counterparty> – fully closed" or similar
+    # Pattern: "Below trades VS : <Counterparty>" with optional " – fully closed" etc.
     section_pattern = _re.compile(
-        r'Below\s+[Tt]rades?\s+VS\s*:\s*(\w[\w\s]*?)(?:\s*[-\u2013\u2014].*?$)',
+        r'^Below\s+[Tt]rades?\s+VS\s*:?\s*(.+)$',
         _re.MULTILINE
     )
     section_matches = list(section_pattern.finditer(text))
@@ -7935,7 +7935,10 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
         section_matches_fallback = False
         sections = []
         for i, m in enumerate(section_matches):
-            cpty = m.group(1).strip()
+            # Strip trailing "– fully closed", "(fully closed)", etc.
+            cpty = _re.sub(r'\s*[-\u2013\u2014(].*$', '', m.group(1)).strip()
+            if not cpty:
+                cpty = m.group(1).strip()
             start = m.start()
             end = section_matches[i + 1].start() if i + 1 < len(section_matches) else len(text)
             sections.append((cpty, text[start:end]))
