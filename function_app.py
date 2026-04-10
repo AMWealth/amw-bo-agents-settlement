@@ -6664,7 +6664,8 @@ def run_settlement_reconciliation(
             matched_aggregated_count += 1
             internal_ids = ",".join([str(r["id"]) for r in rows])
             summed_qty = sum([float(r.get("qty") or 0) for r in rows])
-            summed_amount = sum([float(r.get("transaction_value") or 0) for r in rows])
+            # Use net_amount (= transaction_value ± execution_cost) — same field used in try_aggregate_match
+            summed_amount = sum([float(r.get("net_amount") or r.get("transaction_value") or 0) for r in rows])
             for r in rows:
                 matched_internal_ids.add(r["id"])
 
