@@ -8060,7 +8060,7 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
             # "Netting US91282CHJ36: FAMT : 5,685,000  Interest : $10,244.96  Wired in : $5,692,244.96  SD 4/10/2026"
             summary = _re.search(
                 r'Netting\s+([A-Z]{2}[A-Z0-9]{9,10})\s*:(.*?)(?=Kind\s+regards|$)',
-                section_text, _re.IGNORECASE | _re.DOTALL
+                section_text, _re.DOTALL  # no IGNORECASE: ISIN is uppercase, "Instruction" is not
             )
             if summary:
                 isin_s = summary.group(1)
