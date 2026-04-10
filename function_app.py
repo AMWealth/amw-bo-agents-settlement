@@ -7970,45 +7970,71 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
         if m:
             ssi = 'E/C ' + m.group(1)
 
-        # ── FAB-style: individual "AM Wealth enters Reverse Repo" blocks ─────
+        # ── FAB-style: individual Reverse Repo blocks (various header phrasings) ──
+        _FAB_BLOCK_HDR = (
+            r'(?:'
+            r'AM\s+Wealth\s+(?:enters?|entered?|has\s+entered?|closes?|exercises?)'
+            r'\s+(?:into\s+a?\s+)?(?:Reverse\s+)?Repo'
+            r'|Exercise(?:ing)?\s+of\s+(?:Reverse\s+)?Repo'
+            r'|(?:Reverse\s+)?Repo\s+(?:Closing|Exercise|Exercising)'
+            r')'
+        )
+        _FAB_BLOCK_STOP = (
+            r'(?='
+            r'AM\s+Wealth\s+(?:enters?|closed?|exercises?)'
+            r'|Exercise(?:ing)?\s+of'
+            r'|(?:Reverse\s+)?Repo\s+(?:Closing|Exercise)'
+            r'|Kind\s+regards|@Back\s+Office|$'
+            r')'
+        )
         fab_blocks = list(_re.finditer(
-            r'AM\s+Wealth\s+enters\s+(?:Reverse\s+)?Repo.*?(?=AM\s+Wealth\s+enters|$)',
+            _FAB_BLOCK_HDR + r'.*?' + _FAB_BLOCK_STOP,
             section_text, _re.IGNORECASE | _re.DOTALL
         ))
+
+        def _parse_fab_block(blk, cpty, etype, ssi_val):
+            r = _blank()
+            r['email_type'] = etype
+            r['counterparty'] = cpty
+            r['ssi'] = ssi_val
+            m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', blk)
+            if m: r['isin'] = m.group(1)
+            m = _re.search(r'Face\s+Amount\s*:\s*([\d,.\s]+)', blk, _re.IGNORECASE)
+            if m:
+                r['famt_close'] = _parse_number(m.group(1))
+                r['net_nominal'] = r['famt_close']
+            m = _re.search(r'Settlement\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
+            if m:
+                r['net_amount'] = _parse_number(m.group(1))
+                r['amount_close'] = r['net_amount']
+            m = _re.search(r'Interest\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
+            if m: r['interest'] = _parse_number(m.group(1))
+            m = _re.search(r'(?:All\s+in\s+[Pp]rice)\s*:\s*([\d,.]+)', blk, _re.IGNORECASE)
+            if m: r['rate'] = float(m.group(1).replace(',', ''))
+            m = _re.search(r'Trade\s+Date\s*:\s*([\d/.\-\w]+)', blk, _re.IGNORECASE)
+            if m: r['trade_date'] = _parse_date_cmf(m.group(1))
+            m = _re.search(r'Settlement\s+Date\s*:\s*([\d/.\-\w]+)', blk, _re.IGNORECASE)
+            if m: r['settlement_date'] = _parse_date_cmf(m.group(1))
+            return r
+
         if fab_blocks:
             for blk_m in fab_blocks:
-                blk = blk_m.group(0)
-                r = _blank()
-                r['email_type'] = email_type
-                r['counterparty'] = cpty_name
-                r['ssi'] = ssi
+                r = _parse_fab_block(blk_m.group(0), cpty_name, email_type, ssi)
+                if r['isin']:
+                    results.append(r)
+            continue
 
-                m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', blk)
-                if m: r['isin'] = m.group(1)
-
-                m = _re.search(r'Face\s+Amount\s*:\s*([\d,.\s]+)', blk, _re.IGNORECASE)
-                if m:
-                    r['famt_close'] = _parse_number(m.group(1))
-                    r['net_nominal'] = r['famt_close']
-
-                # Settlement Cash = principal + interest (what gets wired)
-                m = _re.search(r'Settlement\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
-                if m:
-                    r['net_amount'] = _parse_number(m.group(1))
-                    r['amount_close'] = r['net_amount']
-
-                m = _re.search(r'Interest\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
-                if m: r['interest'] = _parse_number(m.group(1))
-
-                m = _re.search(r'(?:All\s+in\s+Price|All\s+in\s+price)\s*:\s*([\d,.]+)', blk, _re.IGNORECASE)
-                if m: r['rate'] = float(m.group(1).replace(',', ''))
-
-                m = _re.search(r'Trade\s+Date\s*:\s*([\d/.\-\w]+)', blk, _re.IGNORECASE)
-                if m: r['trade_date'] = _parse_date_cmf(m.group(1))
-
-                m = _re.search(r'Settlement\s+Date\s*:\s*([\d/.\-\w]+)', blk, _re.IGNORECASE)
-                if m: r['settlement_date'] = _parse_date_cmf(m.group(1))
-
+        # ── FAB fallback: ISIN-based splitting (when block headers don't match) ──
+        # Parse each ISIN occurrence as a separate trade; look for Face Amount + Settlement Date
+        isin_hits = list(_re.finditer(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', section_text))
+        if isin_hits and _re.search(r'Face\s+Amount|Settlement\s+Cash', section_text, _re.IGNORECASE):
+            for i_idx, isin_m in enumerate(isin_hits):
+                # Take 600 chars before the ISIN (fields may precede ISIN in the block)
+                chunk_start = max(0, isin_m.start() - 600)
+                chunk_end = isin_hits[i_idx + 1].start() if i_idx + 1 < len(isin_hits) else len(section_text)
+                chunk = section_text[chunk_start:chunk_end]
+                r = _parse_fab_block(chunk, cpty_name, email_type, ssi)
+                r['isin'] = isin_m.group(1)  # override with the exact ISIN from this hit
                 if r['isin']:
                     results.append(r)
             continue
