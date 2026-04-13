@@ -3490,7 +3490,7 @@ def parse_pdf_file(
     if template_code == "STONEX_DAILY_STATEMENT_PDF":
         return parse_stonex_daily_statement_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
-    if template_code == "INSTINET_PDF":
+    if template_code in {"INSTINET_PDF", "INSTINET_XLSM"}:
         return parse_instinet_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
     if template_code == "ENBD_PDF":
