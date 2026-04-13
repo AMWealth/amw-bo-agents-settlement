@@ -3950,19 +3950,18 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
         else:
             best = candidates[0]
 
-            # For CMF trades (login=5), resolve amount from tab_instructions
-            if best.get("login") == 5:
-                instr = _resolve_instruction_amount(best["id"], isin, sett_date)
-                if instr and instr.get("net_settlement_amount") is not None:
-                    int_amount = instr["net_settlement_amount"]
-                    int_face = instr.get("quantity") or best.get("nominal") or best.get("qty")
-                else:
-                    # Fallback: use deal amount if no instruction found
-                    int_amount = best.get("net_amount") or best.get("transaction_value")
-                    int_face = best.get("nominal") or best.get("qty")
+            # Resolve amount from tab_instructions (net_settlement_amount) for ALL deals.
+            # Instructions contain the netted total across multiple deals (e.g. 2 SELL legs → 1 instruction).
+            # Fall back to individual deal amount only if no instruction found.
+            instr = _resolve_instruction_amount(best["id"], isin, sett_date)
+            if instr and instr.get("net_settlement_amount") is not None:
+                int_amount = instr["net_settlement_amount"]
+                int_face = instr.get("quantity") or best.get("nominal") or best.get("qty")
+                via_instr = True
             else:
                 int_amount = best.get("net_amount") or best.get("transaction_value")
                 int_face = best.get("nominal") or best.get("qty")
+                via_instr = False
 
             int_value_date = best.get("settle_date_cash") or best.get("value_date_cash")
 
@@ -3983,7 +3982,8 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                        or (int_face is not None
                            and values_equal_decimal(sw_face, int_face, Decimal("0.0001"))))
 
-            cmf_tag = " [CMF: matched via instruction]" if best.get("login") == 5 else ""
+            is_cmf = best.get("login") == 5
+            cmf_tag = " [CMF: matched via instruction]" if is_cmf else (" [matched via instruction]" if via_instr else "")
 
             if not date_matched:
                 match_status = "DATE_MISMATCH"
