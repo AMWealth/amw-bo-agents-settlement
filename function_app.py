@@ -1321,7 +1321,10 @@ def parse_instinet_excel(
         consideration = pick_first(rowd, ["consideration", "gross", "principal_amount", "amount"])
         commission = pick_first(rowd, ["commission", "brok_com", "brokerage", "broker_commission"])
         net_amount = pick_first(rowd, ["net", "net_settle", "net_amount", "total_net"])
-        counterparty_reference = pick_first(rowd, ["trans", "trans_no", "transaction_no", "counterparty_reference", "reference", "ref"])
+        # Prefer ticket_id over trans# — Instinet can reuse the same trans#
+        # for multiple trades within the same ISIN (e.g. different client allocations),
+        # but ticket_id is always unique per trade line.
+        counterparty_reference = pick_first(rowd, ["ticket_id", "trans", "trans_no", "transaction_no", "counterparty_reference", "reference", "ref"])
 
         if not counterparty_reference:
             counterparty_reference = "|".join([
