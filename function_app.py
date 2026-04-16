@@ -5768,8 +5768,8 @@ def exact_score(st: Dict[str, Any], td: Dict[str, Any]) -> Tuple[int, List[str]]
         else:
             notes.append("price_mismatch")
 
-    ext_amount = st.get("consideration") if st.get("consideration") is not None else st.get("net_amount")
-    int_amount = td.get("transaction_value") if td.get("transaction_value") else td.get("net_amount")
+    ext_amount = st.get("net_amount") if st.get("net_amount") is not None else st.get("consideration")
+    int_amount = td.get("net_amount") if td.get("net_amount") is not None else td.get("transaction_value")
     if ext_amount is not None and int_amount is not None:
         if values_equal_decimal(ext_amount, int_amount, Decimal("0.5")):
             score += 20
@@ -6645,8 +6645,8 @@ def run_settlement_reconciliation(
                 value_date=st.get("value_date"),
                 external_qty=st.get("quantity"),
                 internal_qty=td.get("qty"),
-                external_amount=st.get("consideration"),
-                internal_amount=td.get("transaction_value"),
+                external_amount=st.get("net_amount") or st.get("consideration"),
+                internal_amount=td.get("net_amount") or td.get("transaction_value"),
                 compare_side=st.get("side"),
                 run_id=run_id,
                 matched_internal_ids=str(td["id"]),
@@ -6687,7 +6687,7 @@ def run_settlement_reconciliation(
                 value_date=st.get("value_date"),
                 external_qty=st.get("quantity"),
                 internal_qty=summed_qty,
-                external_amount=st.get("consideration"),
+                external_amount=st.get("net_amount") or st.get("consideration"),
                 internal_amount=summed_amount,
                 compare_side=st.get("side"),
                 run_id=run_id,
@@ -6729,8 +6729,8 @@ def run_settlement_reconciliation(
                 value_date=st.get("value_date"),
                 external_qty=st.get("quantity"),
                 internal_qty=td.get("qty"),
-                external_amount=st.get("consideration"),
-                internal_amount=td.get("transaction_value"),
+                external_amount=st.get("net_amount") or st.get("consideration"),
+                internal_amount=td.get("net_amount") or td.get("transaction_value"),
                 compare_side=st.get("side"),
                 run_id=run_id,
                 matched_internal_ids=str(td["id"]),
@@ -6768,8 +6768,8 @@ def run_settlement_reconciliation(
                         value_date=st.get("value_date"),
                         external_qty=st.get("quantity"),
                         internal_qty=broad_td.get("qty"),
-                        external_amount=st.get("consideration"),
-                        internal_amount=broad_td.get("transaction_value"),
+                        external_amount=st.get("net_amount") or st.get("consideration"),
+                        internal_amount=broad_td.get("net_amount") or broad_td.get("transaction_value"),
                         compare_side=st.get("side"),
                         run_id=run_id,
                         matched_internal_ids=str(broad_td["id"]),
@@ -6807,8 +6807,8 @@ def run_settlement_reconciliation(
                         value_date=st.get("value_date"),
                         external_qty=st.get("quantity"),
                         internal_qty=broad_td.get("qty"),
-                        external_amount=st.get("consideration"),
-                        internal_amount=broad_td.get("transaction_value"),
+                        external_amount=st.get("net_amount") or st.get("consideration"),
+                        internal_amount=broad_td.get("net_amount") or broad_td.get("transaction_value"),
                         compare_side=st.get("side"),
                         run_id=run_id,
                         matched_internal_ids=str(broad_td["id"]),
@@ -6837,7 +6837,7 @@ def run_settlement_reconciliation(
                 value_date=st.get("value_date"),
                 external_qty=st.get("quantity"),
                 internal_qty=None,
-                external_amount=st.get("consideration"),
+                external_amount=st.get("net_amount") or st.get("consideration"),
                 internal_amount=None,
                 compare_side=st.get("side"),
                 run_id=run_id,
