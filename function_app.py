@@ -7526,21 +7526,25 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
     # Detect action type via :22F::CAEV field
     action_type = None
     caev = rx(r":22F::CAEV[^\n]*(Interest Payment|Cash Dividend|Full Redemption|"
-              r"Partial Redemption|Call Redemption)", text)
+              r"Partial Redemption|Call Redemption|Full Call|Early Redemption)", text)
     if caev:
         caev_upper = caev.upper()
         if "INTEREST" in caev_upper:
             action_type = "COUPON"
         elif "DIVIDEND" in caev_upper:
             action_type = "DIVIDEND"
-        elif "FULL" in caev_upper or "CALL" in caev_upper:
+        elif "CALL" in caev_upper or "EARLY" in caev_upper:
+            action_type = "CALL_REDEMPTION"
+        elif "FULL" in caev_upper:
             action_type = "FULL_REDEMPTION"
         elif "PARTIAL" in caev_upper:
             action_type = "PARTIAL_REDEMPTION"
 
     # Fallback: keyword search
     if not action_type:
-        if re.search(r"FULL\s+REDEMPTION|CALL\s+REDEMPTION", text_upper):
+        if re.search(r"CALL\s+REDEMPTION|FULL\s+CALL|EARLY\s+REDEMPTION", text_upper):
+            action_type = "CALL_REDEMPTION"
+        elif re.search(r"FULL\s+REDEMPTION", text_upper):
             action_type = "FULL_REDEMPTION"
         elif re.search(r"PARTIAL\s+REDEMPTION", text_upper):
             action_type = "PARTIAL_REDEMPTION"
@@ -7717,6 +7721,7 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
         "COUPON": f"Interest Payment | ISIN {isin or 'N/A'} | {amount_str} | Pay Date {payment_date or 'N/A'}",
         "PARTIAL_REDEMPTION": f"Partial Redemption | ISIN {isin or 'N/A'} | Nominal {nominal or 'N/A'} | {amount_str} | Date {payment_date or 'N/A'}",
         "FULL_REDEMPTION": f"Full Redemption | ISIN {isin or 'N/A'} | Nominal {nominal or 'N/A'} | {amount_str} | Date {payment_date or 'N/A'}",
+        "CALL_REDEMPTION": f"Call Redemption | ISIN {isin or 'N/A'} | Nominal {nominal or 'N/A'} | {amount_str} | Date {payment_date or 'N/A'}",
     }
     comment = comment_parts.get(action_type, "")
 
