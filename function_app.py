@@ -7949,7 +7949,11 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
     text = body_text
     upper = text.upper()
 
-    if 'NO CMF MOVEMENT' in upper:
+    # Only skip if "No CMF movement" is present AND there is no actual trade data.
+    # RE: chains may contain "No CMF movements" in quoted old emails while the
+    # fresh part has a new Reverse Repo / trade block.
+    if 'NO CMF MOVEMENT' in upper and not _re.search(
+            r'AM\s+Wealth\s+enters|ISIN\s*:|New\s+[Tt]rade\s+opened', text):
         return []
 
     def _blank():
@@ -8051,7 +8055,9 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
             if m:
                 r['famt_close'] = _parse_number(m.group(1))
                 r['net_nominal'] = r['famt_close']
-            m = _re.search(r'Settlement\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
+            m = (_re.search(r'Settlement\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
+                 or _re.search(r'Start\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
+                 or _re.search(r'(?:Wired\s+Amt|Cash)\s*[.:]?\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE))
             if m:
                 r['net_amount'] = _parse_number(m.group(1))
                 r['amount_close'] = r['net_amount']
