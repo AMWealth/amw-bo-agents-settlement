@@ -8067,12 +8067,17 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
             if m:
                 r['famt_close'] = _parse_number(m.group(1))
                 r['net_nominal'] = r['famt_close']
-            m = (_re.search(r'Settlement\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
-                 or _re.search(r'Start\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
-                 or _re.search(r'(?:Wired\s+Amt|Cash)\s*[.:]?\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE))
-            if m:
-                r['net_amount'] = _parse_number(m.group(1))
-                r['amount_close'] = r['net_amount']
+            for _cash_pat in [
+                r'Settlement\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)',
+                r'Start\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)',
+                r'Wired\s+Amt\s*[.:]?\s*(?:USD\s*)?([\d,.\s]+)',
+                r'Cash\s*[.:]?\s*(?:USD\s*)?([\d,.\s]+)',
+            ]:
+                _cm = _re.search(_cash_pat, blk, _re.IGNORECASE)
+                if _cm and _parse_number(_cm.group(1)):
+                    r['net_amount'] = _parse_number(_cm.group(1))
+                    r['amount_close'] = r['net_amount']
+                    break
             m = _re.search(r'Interest\s*:\s*(?:USD\s*)?([\d,.\s]+)', blk, _re.IGNORECASE)
             if m: r['interest'] = _parse_number(m.group(1))
             m = _re.search(r'(?:All\s+in\s+[Pp]rice)\s*:\s*([\d,.]+)', blk, _re.IGNORECASE)
