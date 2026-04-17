@@ -3872,9 +3872,13 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                 """, (isin, action_val))
             return [dict(r) for r in cur.fetchall()]
 
-    def _resolve_instruction_amount(deal_id, isin_val, sett_date_val=None):
-        """For CMF (login=5) deals, resolve the actual netted amount from tab_instructions.
-        Direct lookup by ISIN + instruction_type + value_date (CMF chain is often empty)."""
+    def _resolve_instruction_amount(deal_id, isin_val, sett_date_val=None,
+                                     target_amount=None, exclude_instr_ids=None):
+        """Resolve the actual netted amount from tab_instructions.
+        When target_amount is provided and multiple instructions exist for the
+        same ISIN+side+date, pick the one closest to the SWIFT settled amount
+        (avoids mismatches when duplicate ISINs settle on the same day).
+        exclude_instr_ids prevents the same instruction from being claimed twice."""
         side_text = None  # will be set below
         # First get deal's action to determine instruction_type
         with conn.cursor() as cur:
@@ -3884,6 +3888,28 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                 side_text = 'BUY' if r[0] == 0 else 'SELL'
         if not side_text:
             return None
+
+        def _pick_best(rows, target_amt, excluded):
+            """From a list of instruction rows, pick the best match.
+            If target_amt given: closest by net_settlement_amount (skip excluded).
+            Otherwise: first row (latest by id DESC, same as old behaviour)."""
+            available = rows
+            if excluded:
+                available = [r for r in rows if r['instruction_id'] not in excluded]
+                if not available:
+                    available = rows  # fallback: allow re-use if all claimed
+            if not available:
+                return None
+            if target_amt is None:
+                return available[0]
+            # Pick instruction with net_settlement_amount closest to target
+            try:
+                target_f = float(target_amt)
+            except (TypeError, ValueError):
+                return available[0]
+            return min(available,
+                       key=lambda r: abs(float(r['net_settlement_amount']) - target_f))
+
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             # Try with date match first
             if sett_date_val:
@@ -3893,11 +3919,11 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                     FROM back_office.tab_instructions
                     WHERE isin = %s AND instruction_type = %s AND value_date = %s
                       AND net_settlement_amount IS NOT NULL
-                    ORDER BY id DESC LIMIT 1
+                    ORDER BY id DESC
                 """, (isin_val, side_text, sett_date_val))
-                row = cur.fetchone()
-                if row:
-                    return dict(row)
+                rows = [dict(r) for r in cur.fetchall()]
+                if rows:
+                    return _pick_best(rows, target_amount, exclude_instr_ids)
             # Fallback: latest instruction for this ISIN + side
             cur.execute("""
                 SELECT id AS instruction_id, net_settlement_amount, quantity,
@@ -3905,10 +3931,10 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                 FROM back_office.tab_instructions
                 WHERE isin = %s AND instruction_type = %s
                   AND net_settlement_amount IS NOT NULL
-                ORDER BY id DESC LIMIT 1
+                ORDER BY id DESC
             """, (isin_val, side_text))
-            row = cur.fetchone()
-            return dict(row) if row else None
+            rows = [dict(r) for r in cur.fetchall()]
+            return _pick_best(rows, target_amount, exclude_instr_ids)
 
     # Pre-load set of (ISIN, action) pairs that have at least one deal with login IN (1,5)
     # Used to skip NOT_FOUND rows where no FAB/CMF deals exist for that side
@@ -3921,6 +3947,8 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
         _fab_isin_actions = {(r[0], r[1]) for r in cur.fetchall()}
 
     results = []
+    claimed_deal_ids = set()   # prevent same deal being matched to two SWIFT rows
+    claimed_instr_ids = set()  # prevent same instruction being matched twice
     for sw in swift_rows:
         isin = (sw.get("isin") or "").upper().strip()
         side = (sw.get("side") or "").upper()
@@ -3952,12 +3980,19 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
             row["face_amount_match"] = None
             row["counterparty"] = None
         else:
-            best = candidates[0]
+            # Filter out deals already claimed by a previous SWIFT row (duplicate ISIN handling)
+            available = [c for c in candidates if c['id'] not in claimed_deal_ids]
+            if not available:
+                available = candidates  # fallback: allow re-match if all claimed
+            best = available[0]
 
             # Resolve amount from tab_instructions (net_settlement_amount) for ALL deals.
             # Instructions contain the netted total across multiple deals (e.g. 2 SELL legs → 1 instruction).
             # Fall back to individual deal amount only if no instruction found.
-            instr = _resolve_instruction_amount(best["id"], isin, sett_date)
+            # target_amount + exclude_instr_ids ensure the closest unclaimed instruction is picked.
+            instr = _resolve_instruction_amount(best["id"], isin, sett_date,
+                                                target_amount=sw_amount,
+                                                exclude_instr_ids=claimed_instr_ids)
             if instr and instr.get("net_settlement_amount") is not None:
                 int_amount = instr["net_settlement_amount"]
                 int_face = instr.get("quantity") or best.get("nominal") or best.get("qty")
@@ -4028,6 +4063,11 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                       amount_diff, face_ok, int_face, int_value_date,
                       sw["id"]))
             conn.commit()
+
+            # Track claimed deal and instruction to avoid double-matching
+            claimed_deal_ids.add(best['id'])
+            if instr and instr.get('instruction_id'):
+                claimed_instr_ids.add(instr['instruction_id'])
 
         results.append(row)
 
