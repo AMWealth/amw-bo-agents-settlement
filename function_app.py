@@ -7930,7 +7930,8 @@ def _parse_date_cmf(s: str) -> Optional[str]:
     if not s:
         return None
     s = s.strip()
-    for fmt in ('%m/%d/%y', '%m/%d/%Y', '%d/%m/%y', '%d/%m/%Y', '%Y-%m-%d'):
+    for fmt in ('%m/%d/%y', '%m/%d/%Y', '%d/%m/%y', '%d/%m/%Y', '%Y-%m-%d',
+                '%d %b %Y', '%d %B %Y', '%d-%b-%Y', '%d-%B-%Y'):
         try:
             d = datetime.strptime(s, fmt)
             return d.strftime('%Y-%m-%d')
@@ -7988,6 +7989,10 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
     else:
         section_matches_fallback = False
         sections = []
+        # Include text before the first "Below trades" match as its own section
+        # (RE: chains may have new trade data above the quoted "Below trades" block)
+        if section_matches[0].start() > 0:
+            sections.append(('', text[:section_matches[0].start()]))
         for i, m in enumerate(section_matches):
             # Strip trailing "– fully closed", "(fully closed)", etc.
             cpty = _re.sub(r'\s*[-\u2013\u2014(].*$', '', m.group(1)).strip()
