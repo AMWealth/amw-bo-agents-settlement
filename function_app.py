@@ -7911,6 +7911,8 @@ def _strip_html(html_text: str) -> str:
     text = _re.sub(r'<[^>]+>', ' ', text)
     text = unescape(text)
     text = _re.sub(r'[^\S\n]+', ' ', text)
+    # Collapse double-colon artifacts from "Label:</td><td>Value" → "Label: : Value" → "Label: Value"
+    text = _re.sub(r':\s*:', ':', text)
     return text.strip()
 
 
@@ -8075,10 +8077,10 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
             if m: r['interest'] = _parse_number(m.group(1))
             m = _re.search(r'(?:All\s+in\s+[Pp]rice)\s*:\s*([\d,.]+)', blk, _re.IGNORECASE)
             if m: r['rate'] = float(m.group(1).replace(',', ''))
-            m = _re.search(r'Trade\s+Date\s*:\s*([\d/.\-\w]+)', blk, _re.IGNORECASE)
-            if m: r['trade_date'] = _parse_date_cmf(m.group(1))
-            m = _re.search(r'Settlement\s+Date\s*:\s*([\d/.\-\w]+)', blk, _re.IGNORECASE)
-            if m: r['settlement_date'] = _parse_date_cmf(m.group(1))
+            m = _re.search(r'Trade\s+Date\s*:\s*(.+)', blk, _re.IGNORECASE)
+            if m: r['trade_date'] = _parse_date_cmf(m.group(1).strip())
+            m = _re.search(r'Settlement\s+Date\s*:\s*(.+)', blk, _re.IGNORECASE)
+            if m: r['settlement_date'] = _parse_date_cmf(m.group(1).strip())
             return r
 
         if fab_blocks:
