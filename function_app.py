@@ -8295,6 +8295,18 @@ def _process_cmf_message(
     # Insert each parsed trade into tab_cmf_parsed
     with conn.cursor() as cur:
         for parsed in parsed_list:
+            # Dedup by ISIN + trade_date + net_amount across all emails (prevents Re:/Fwd: duplicates)
+            if parsed.get('isin') and parsed.get('trade_date') and parsed.get('net_amount'):
+                cur.execute("""
+                    SELECT id FROM back_office_auto.tab_cmf_parsed
+                    WHERE isin = %s AND trade_date = %s AND net_amount = %s
+                    LIMIT 1
+                """, (parsed['isin'], parsed['trade_date'], parsed['net_amount']))
+                if cur.fetchone():
+                    logging.warning("CMF dedup: skipping ISIN %s trade_date %s amount %s — already exists",
+                                    parsed['isin'], parsed['trade_date'], parsed['net_amount'])
+                    continue
+
             cur.execute("""
                 INSERT INTO back_office_auto.tab_cmf_parsed
                     (email_id, received_at, email_type, counterparty, isin,
