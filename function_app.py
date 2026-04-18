@@ -7533,21 +7533,23 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
             action_type = "COUPON"
         elif "DIVIDEND" in caev_upper:
             action_type = "DIVIDEND"
-        elif "CALL" in caev_upper or "EARLY" in caev_upper:
-            action_type = "CALL_REDEMPTION"
         elif "FULL" in caev_upper:
+            # "Full Redemption", "Full Call/Early Redemption" → REDEMPTION
             action_type = "FULL_REDEMPTION"
         elif "PARTIAL" in caev_upper:
+            # "Partial Redemption With Pool Factor Reduction" → CALL REDEMPTION
             action_type = "PARTIAL_REDEMPTION"
+        elif "CALL" in caev_upper or "EARLY" in caev_upper:
+            action_type = "CALL_REDEMPTION"
 
     # Fallback: keyword search
     if not action_type:
-        if re.search(r"CALL\s+REDEMPTION|FULL\s+CALL|EARLY\s+REDEMPTION", text_upper):
-            action_type = "CALL_REDEMPTION"
-        elif re.search(r"FULL\s+REDEMPTION", text_upper):
+        if re.search(r"FULL\s+CALL|FULL\s+REDEMPTION|EARLY\s+REDEMPTION", text_upper):
             action_type = "FULL_REDEMPTION"
         elif re.search(r"PARTIAL\s+REDEMPTION", text_upper):
             action_type = "PARTIAL_REDEMPTION"
+        elif re.search(r"CALL\s+REDEMPTION", text_upper):
+            action_type = "CALL_REDEMPTION"
         elif re.search(r"INTEREST\s+PAYMENT", text_upper):
             action_type = "COUPON"
         elif re.search(r"CASH\s+DIVIDEND", text_upper):
