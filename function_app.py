@@ -1778,11 +1778,14 @@ def parse_camcap_pdf(
     # "Price 98.5000" — percentage price without % sign
     # "Total Cash Settlement Amount 197,000.00 USD"
 
-    direction_phrase = (
-        rx(r"CAMcap\s+Markets\s+Ltd\s+(SELLS|BUYS|SELL|BUY)", text)
-        or rx(r"\b(SELLS|BUYS|BUY|SELL)\b", text)
-    )
-    side = normalize_side(direction_phrase, "CAMCAP_PDF")
+    # CamCap's action is from their perspective: "CAMcap SELLS" = they sell TO us = we BUY
+    _camcap_phrase = rx(r"CAMcap\s+Markets\s+Ltd\s+(SELLS|BUYS|SELL|BUY)", text)
+    if _camcap_phrase:
+        _their_side = normalize_side(_camcap_phrase, "CAMCAP_PDF")
+        side = "BUY" if _their_side == "SELL" else ("SELL" if _their_side == "BUY" else None)
+    else:
+        direction_phrase = rx(r"\b(SELLS|BUYS|BUY|SELL)\b", text)
+        side = normalize_side(direction_phrase, "CAMCAP_PDF")
 
     isin = (
         rx(r"ISIN\s+Code\s+([A-Z]{2}[A-Z0-9]{9,12})", text)
@@ -1818,7 +1821,7 @@ def parse_camcap_pdf(
     nominal = parse_decimal(nominal_raw)
     price_pct = parse_decimal(price_pct_raw)
     consideration = parse_decimal(principal_raw) or parse_decimal(total_cash_raw)
-    net_amount = parse_decimal(total_cash_raw)
+    net_amount = parse_decimal(total_cash_raw) or consideration
     accrued = parse_decimal(accrued_raw)
 
     if not ref:
