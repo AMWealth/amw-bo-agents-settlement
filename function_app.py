@@ -8257,19 +8257,8 @@ def _process_cmf_message(
     processing_run_id: int,
 ) -> Tuple[str, int]:
     """Handle CMF (Cash Management Facilities) emails — parse body and store to tab_cmf_parsed."""
-    # Allow re-parsing: ON CONFLICT DO UPDATE will refresh data
-    # (skip only if already in tab_cmf_parsed with non-pending status)
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT COUNT(*) FROM back_office_auto.tab_cmf_parsed WHERE email_id = %s AND status IN ('pending', 'review_required')",
-            (internet_message_id,)
-        )
-        row = cur.fetchone()
-        # Skip only if this email already has pending/review trades (actively being worked on)
-        # Do NOT skip if all trades are in terminal state — the email may contain new trades
-        # that weren't parsed before (e.g. multiple blocks where only one was matched)
-        if row and row[0] > 0:
-            return ("ALREADY_PROCESSED", 0)
+    # Always re-parse: ON CONFLICT DO UPDATE preserves existing statuses (instructed/skipped)
+    # and inserts any new trades that weren't parsed before (e.g. multi-block emails)
 
     message_id = msg["id"]
 
