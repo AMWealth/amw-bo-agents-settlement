@@ -7356,8 +7356,12 @@ def run_email_parser_http(req: func.HttpRequest) -> func.HttpResponse:
         run_id = start_agent_run(conn, "run_email_parser_http")
         mapping_by_sender = load_mapping(conn)
         allowed_senders = get_allowed_senders(mapping_by_sender)
-        since_hours_param = req.params.get("since_hours")
-        lookback = int(since_hours_param) if since_hours_param and since_hours_param.isdigit() else LOOKBACK_HOURS
+        try:
+            _body = req.get_json()
+        except Exception:
+            _body = {}
+        since_hours_param = req.params.get("since_hours") or (_body or {}).get("since_hours")
+        lookback = int(since_hours_param) if since_hours_param else LOOKBACK_HOURS
         since_dt = now_utc() - timedelta(hours=lookback)
         total = parsed_messages = parsed_trades = skipped = 0
         for mailbox in GRAPH_MAILBOXES:
