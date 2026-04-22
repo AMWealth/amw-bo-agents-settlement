@@ -8048,6 +8048,7 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
             r'\s+(?:into\s+a?\s+)?(?:Reverse\s+)?Repo'
             r'|Exercise(?:ing)?\s+of\s+(?:Reverse\s+)?Repo'
             r'|(?:Reverse\s+)?Repo\s+(?:Closing|Exercise|Exercising)'
+            r'|Opened?\s+\S+\s*:'
             r')'
         )
         _FAB_BLOCK_STOP = (
@@ -8055,6 +8056,7 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
             r'AM\s+Wealth\s+(?:enters?|closed?|exercises?)'
             r'|Exercise(?:ing)?\s+of'
             r'|(?:Reverse\s+)?Repo\s+(?:Closing|Exercise)'
+            r'|Opened?\s+\S+\s*:'
             r'|Kind\s+regards|@Back\s+Office|$'
             r')'
         )
@@ -8066,18 +8068,24 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
         def _parse_fab_block(blk, cpty, etype, ssi_val):
             r = _blank()
             r['email_type'] = etype
-            r['counterparty'] = cpty
             r['ssi'] = ssi_val
+            # Extract counterparty from "Opened StoneX :" style header if not set
+            if not cpty:
+                _mc = _re.match(r'Opened?\s+(\S+)\s*:', blk.strip(), _re.IGNORECASE)
+                if _mc:
+                    cpty = _mc.group(1).strip()
+            r['counterparty'] = cpty
             m = _re.search(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', blk)
             if m: r['isin'] = m.group(1)
-            m = _re.search(r'Face\s+Amount\s*:\s*([\d,.\s]+)', blk, _re.IGNORECASE)
+            m = (_re.search(r'Face\s+Amount\s*:\s*([\d,.\s]+)', blk, _re.IGNORECASE)
+                 or _re.search(r'\bFAMT\s*:\s*([\d,.\s]+)', blk, _re.IGNORECASE))
             if m:
                 r['famt_close'] = _parse_number(m.group(1))
                 r['net_nominal'] = r['famt_close']
             for _cash_pat in [
                 r'Settlement\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)',
                 r'Start\s+Cash\s*:\s*(?:USD\s*)?([\d,.\s]+)',
-                r'Wired\s+Amt\s*[.:]?\s*(?:USD\s*)?([\d,.\s]+)',
+                r'Wired\s+(?:Amt|out)\s*[.:]?\s*(?:USD\s*)?([\d,.\s]+)',
                 r'Cash\s*[.:]?\s*(?:USD\s*)?([\d,.\s]+)',
             ]:
                 _cm = _re.search(_cash_pat, blk, _re.IGNORECASE)
@@ -8089,9 +8097,11 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
             if m: r['interest'] = _parse_number(m.group(1))
             m = _re.search(r'(?:All\s+in\s+[Pp]rice)\s*:\s*([\d,.]+)', blk, _re.IGNORECASE)
             if m: r['rate'] = float(m.group(1).replace(',', ''))
-            m = _re.search(r'Trade\s+Date\s*:\s*(.+)', blk, _re.IGNORECASE)
+            m = (_re.search(r'Trade\s+Date\s*:\s*(.+)', blk, _re.IGNORECASE)
+                 or _re.search(r'\bTD\s*:\s*([\d/.\-]+)', blk, _re.IGNORECASE))
             if m: r['trade_date'] = _parse_date_cmf(m.group(1).strip())
-            m = _re.search(r'Settlement\s+Date\s*:\s*(.+)', blk, _re.IGNORECASE)
+            m = (_re.search(r'Settlement\s+Date\s*:\s*(.+)', blk, _re.IGNORECASE)
+                 or _re.search(r'\bSD\s*:\s*([\d/.\-]+)', blk, _re.IGNORECASE))
             if m: r['settlement_date'] = _parse_date_cmf(m.group(1).strip())
             return r
 
