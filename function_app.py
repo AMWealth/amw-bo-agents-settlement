@@ -8051,7 +8051,7 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
             r'\s+(?:into\s+a?\s+)?(?:Reverse\s+)?Repo'
             r'|Exercise(?:ing)?\s+of\s+(?:Reverse\s+)?Repo'
             r'|(?:Reverse\s+)?Repo\s+(?:Closing|Exercise|Exercising)'
-            r'|Opened?\s+\S+\s*:'
+            r'|(?:Opened?|Closed?)\s+\S+\s*:'
             r')'
         )
         _FAB_BLOCK_STOP = (
@@ -8059,7 +8059,7 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
             r'AM\s+Wealth\s+(?:enters?|closed?|exercises?)'
             r'|Exercise(?:ing)?\s+of'
             r'|(?:Reverse\s+)?Repo\s+(?:Closing|Exercise)'
-            r'|Opened?\s+\S+\s*:'
+            r'|(?:Opened?|Closed?)\s+\S+\s*:'
             r'|Kind\s+regards|@Back\s+Office|$'
             r')'
         )
@@ -8072,9 +8072,9 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
             r = _blank()
             r['email_type'] = etype
             r['ssi'] = ssi_val
-            # Extract counterparty from "Opened StoneX :" style header if not set
+            # Extract counterparty from "Opened StoneX :" / "Closed FAB :" header if not set
             if not cpty:
-                _mc = _re.match(r'Opened?\s+(\S+)\s*:', blk.strip(), _re.IGNORECASE)
+                _mc = _re.match(r'(?:Opened?|Closed?)\s+(\S+)\s*:', blk.strip(), _re.IGNORECASE)
                 if _mc:
                     cpty = _mc.group(1).strip()
             r['counterparty'] = cpty
