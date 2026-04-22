@@ -8113,6 +8113,13 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
                 r = _parse_fab_block(blk_m.group(0), cpty_name, email_type, ssi)
                 if r['isin']:
                     results.append(r)
+            # Also parse text BEFORE the first FAB block — may contain separate trade fields
+            # e.g. StoneX plain-text block above "Closed FAB: AM Wealth enters Reverse Repo"
+            pre_fab = section_text[:fab_blocks[0].start()].strip()
+            if pre_fab and _re.search(r'ISIN\s*:?\s*[A-Z]{2}[A-Z0-9]{9,10}', pre_fab):
+                r = _parse_fab_block(pre_fab, cpty_name, email_type, ssi)
+                if r['isin']:
+                    results.append(r)
             continue
 
         # ── FAB fallback: ISIN-based splitting (when block headers don't match) ──
