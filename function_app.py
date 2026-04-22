@@ -8311,6 +8311,21 @@ def _process_cmf_message(
     # Insert each parsed trade into tab_cmf_parsed
     with conn.cursor() as cur:
         for parsed in parsed_list:
+            # Same-email dedup by (email_id, isin): prevents duplicate rows when
+            # counterparty changes between re-parses (e.g. '' → 'FAB').
+            # If record exists: update counterparty if it was empty, then skip INSERT.
+            if parsed.get('isin'):
+                cur.execute("""
+                    SELECT id, counterparty FROM back_office_auto.tab_cmf_parsed
+                    WHERE email_id = %s AND isin = %s LIMIT 1
+                """, (internet_message_id, parsed['isin']))
+                _same = cur.fetchone()
+                if _same:
+                    if not (_same[1] or '').strip() and (parsed.get('counterparty') or '').strip():
+                        cur.execute("UPDATE back_office_auto.tab_cmf_parsed SET counterparty = %s WHERE id = %s",
+                                    (parsed['counterparty'], _same[0]))
+                    continue
+
             # Dedup by ISIN + trade_date + net_amount across all emails (prevents Re:/Fwd: duplicates)
             if parsed.get('isin') and parsed.get('trade_date') and parsed.get('net_amount'):
                 cur.execute("""
