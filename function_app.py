@@ -8258,12 +8258,14 @@ def _process_cmf_message(
     # (skip only if already in tab_cmf_parsed with non-pending status)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT COUNT(*), MIN(status) FROM back_office_auto.tab_cmf_parsed WHERE email_id = %s",
+            "SELECT COUNT(*) FROM back_office_auto.tab_cmf_parsed WHERE email_id = %s AND status IN ('pending', 'review_required')",
             (internet_message_id,)
         )
         row = cur.fetchone()
-        # Skip only if ALL rows for this email are in a terminal non-pending state
-        if row and row[0] > 0 and row[1] not in ('pending', 'review_required'):
+        # Skip only if this email already has pending/review trades (actively being worked on)
+        # Do NOT skip if all trades are in terminal state — the email may contain new trades
+        # that weren't parsed before (e.g. multiple blocks where only one was matched)
+        if row and row[0] > 0:
             return ("ALREADY_PROCESSED", 0)
 
     message_id = msg["id"]
