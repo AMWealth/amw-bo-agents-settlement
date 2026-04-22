@@ -8110,7 +8110,11 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
 
         if fab_blocks:
             for blk_m in fab_blocks:
-                r = _parse_fab_block(blk_m.group(0), cpty_name, email_type, ssi)
+                # Look backwards up to 400 chars for a "Closed FAB :" / "Opened X :" label
+                pre_blk = section_text[max(0, blk_m.start() - 400):blk_m.start()]
+                _lbl = _re.search(r'(?:Opened?|Closed?)\s+(\S+)\s*:', pre_blk, _re.IGNORECASE)
+                block_cpty = _lbl.group(1).strip() if _lbl else cpty_name
+                r = _parse_fab_block(blk_m.group(0), block_cpty, email_type, ssi)
                 if r['isin']:
                     results.append(r)
             # Also parse text BEFORE the first FAB block — may contain separate trade fields
