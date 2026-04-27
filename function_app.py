@@ -8129,7 +8129,7 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
         # ── FAB fallback: ISIN-based splitting (when block headers don't match) ──
         # Parse each ISIN occurrence as a separate trade; look for Face Amount + Settlement Date
         isin_hits = list(_re.finditer(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', section_text))
-        if isin_hits and _re.search(r'Face\s+Amount|Settlement\s+Cash', section_text, _re.IGNORECASE):
+        if isin_hits and _re.search(r'Face\s+Amount|Settlement\s+Cash|FAMT\s*:|Wired\s+out\s*:', section_text, _re.IGNORECASE):
             for i_idx, isin_m in enumerate(isin_hits):
                 # Take 600 chars before the ISIN (fields may precede ISIN in the block)
                 chunk_start = max(0, isin_m.start() - 600)
