@@ -8315,14 +8315,14 @@ def _process_cmf_message(
     # Insert each parsed trade into tab_cmf_parsed
     with conn.cursor() as cur:
         for parsed in parsed_list:
-            # Same-email dedup by (email_id, isin): prevents duplicate rows when
-            # counterparty changes between re-parses (e.g. '' → 'FAB').
-            # If record exists: update counterparty if it was empty, then skip INSERT.
+            # Same-email dedup by (email_id, isin, email_type): prevents duplicate rows when
+            # counterparty changes between re-parses (e.g. '' → 'FAB'), while allowing
+            # a close (fully_closed) and a new trade (new_trade) for the same ISIN in one email.
             if parsed.get('isin'):
                 cur.execute("""
                     SELECT id, counterparty FROM back_office_auto.tab_cmf_parsed
-                    WHERE email_id = %s AND isin = %s LIMIT 1
-                """, (internet_message_id, parsed['isin']))
+                    WHERE email_id = %s AND isin = %s AND email_type = %s LIMIT 1
+                """, (internet_message_id, parsed['isin'], parsed.get('email_type', '')))
                 _same = cur.fetchone()
                 if _same:
                     if not (_same[1] or '').strip() and (parsed.get('counterparty') or '').strip():
@@ -8352,7 +8352,7 @@ def _process_cmf_message(
                         %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
                         %s, %s, %s, 'pending')
-                ON CONFLICT (email_id, isin, counterparty) DO UPDATE SET
+                ON CONFLICT (email_id, isin, counterparty, email_type) DO UPDATE SET
                     email_type = EXCLUDED.email_type,
                     famt_close = EXCLUDED.famt_close,
                     famt_reopen = EXCLUDED.famt_reopen,
