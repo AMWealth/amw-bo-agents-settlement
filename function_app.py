@@ -8130,15 +8130,17 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
         # Parse each ISIN occurrence as a separate trade; look for Face Amount + Settlement Date
         isin_hits = list(_re.finditer(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', section_text))
         if isin_hits and _re.search(r'Face\s+Amount|Settlement\s+Cash|FAMT\s*:|Wired\s+out\s*:', section_text, _re.IGNORECASE):
+            prev_chunk_end = 0
             for i_idx, isin_m in enumerate(isin_hits):
-                # Take 600 chars before the ISIN (fields may precede ISIN in the block)
-                chunk_start = max(0, isin_m.start() - 600)
+                # Never overlap the previous ISIN's chunk (prevents bleeding amounts across ISINs)
+                chunk_start = max(prev_chunk_end, isin_m.start() - 600)
                 chunk_end = isin_hits[i_idx + 1].start() if i_idx + 1 < len(isin_hits) else len(section_text)
                 chunk = section_text[chunk_start:chunk_end]
                 r = _parse_fab_block(chunk, cpty_name, email_type, ssi)
                 r['isin'] = isin_m.group(1)  # override with the exact ISIN from this hit
                 if r['isin']:
                     results.append(r)
+                prev_chunk_end = chunk_end
             continue
 
         # ── StoneX-style: summary netting line takes priority over individual blocks ──
