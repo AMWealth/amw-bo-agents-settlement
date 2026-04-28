@@ -8044,50 +8044,6 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
         if m:
             ssi = 'E/C ' + m.group(1)
 
-        # ── Mixed section: "Closing Deal" table + "Open deal :" block in same email ──
-        # Format: closing repo in a tabular row (bare ISIN, no "ISIN:" prefix)
-        # followed by a new repo in "ISIN : / FAMT : / Wired out :" format
-        open_deal_m = _re.search(r'Open\s+deal\s*:', section_text, _re.IGNORECASE)
-        if email_type == 'fully_closed' and open_deal_m:
-            # Parse "Closing Deal" table row: Trade ID + bare ISIN + FAMT + ... + dates + interest + net
-            close_row_m = _re.search(
-                r'-?\d+\s+([A-Z]{2}[A-Z0-9]{9,10})\s+'
-                r'([\d, ]+?)\s+'
-                r'[\d.]+%\s+\d+%\s+'
-                r'\$?\s*([\d,]+(?:\.\d+)?)\s+'
-                r'[\d.]+\s+\w+\s+'
-                r'(\d{1,2}/\d{1,2}/\d{2,4})\s+'
-                r'(\d{1,2}/\d{1,2}/\d{2,4})\s+'
-                r'([\d,]+(?:\.\d+)?)\s+'
-                r'([\d,]+(?:\.\d+)?)',
-                section_text
-            )
-            if close_row_m:
-                r = _blank()
-                r['email_type'] = 'fully_closed'
-                r['counterparty'] = cpty_name
-                r['isin'] = close_row_m.group(1)
-                r['famt_close'] = _parse_number(close_row_m.group(2))
-                r['amount_close'] = _parse_number(close_row_m.group(3))
-                r['interest'] = _parse_number(close_row_m.group(6))
-                r['net_amount'] = _parse_number(close_row_m.group(7))
-                td = _parse_date_cmf(close_row_m.group(4))
-                sd = _parse_date_cmf(close_row_m.group(5))
-                if td:
-                    r['trade_date'] = td
-                if sd:
-                    r['settlement_date'] = sd
-                r['currency'] = 'USD'
-                r['ssi'] = ssi
-                if r['isin']:
-                    results.append(r)
-            # Parse "Open deal :" sub-section as new_trade
-            open_text = section_text[open_deal_m.start():]
-            r2 = _parse_fab_block(open_text, cpty_name, 'new_trade', ssi)
-            if r2['isin']:
-                results.append(r2)
-            continue
-
         # ── FAB-style: individual Reverse Repo blocks (various header phrasings) ──
         _FAB_BLOCK_HDR = (
             r'(?:'
@@ -8151,6 +8107,46 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
                  or _re.search(r'\bSD\s*:\s*([\d/.\-]+)', blk, _re.IGNORECASE))
             if m: r['settlement_date'] = _parse_date_cmf(m.group(1).strip())
             return r
+
+        # ── Mixed section: "Closing Deal" table + "Open deal :" block in same email ──
+        open_deal_m = _re.search(r'Open\s+deal\s*:', section_text, _re.IGNORECASE)
+        if email_type == 'fully_closed' and open_deal_m:
+            close_row_m = _re.search(
+                r'-?\d+\s+([A-Z]{2}[A-Z0-9]{9,10})\s+'
+                r'([\d, ]+?)\s+'
+                r'[\d.]+%\s+\d+%\s+'
+                r'\$?\s*([\d,]+(?:\.\d+)?)\s+'
+                r'[\d.]+\s+\w+\s+'
+                r'(\d{1,2}/\d{1,2}/\d{2,4})\s+'
+                r'(\d{1,2}/\d{1,2}/\d{2,4})\s+'
+                r'([\d,]+(?:\.\d+)?)\s+'
+                r'([\d,]+(?:\.\d+)?)',
+                section_text
+            )
+            if close_row_m:
+                r = _blank()
+                r['email_type'] = 'fully_closed'
+                r['counterparty'] = cpty_name
+                r['isin'] = close_row_m.group(1)
+                r['famt_close'] = _parse_number(close_row_m.group(2))
+                r['amount_close'] = _parse_number(close_row_m.group(3))
+                r['interest'] = _parse_number(close_row_m.group(6))
+                r['net_amount'] = _parse_number(close_row_m.group(7))
+                td = _parse_date_cmf(close_row_m.group(4))
+                sd = _parse_date_cmf(close_row_m.group(5))
+                if td:
+                    r['trade_date'] = td
+                if sd:
+                    r['settlement_date'] = sd
+                r['currency'] = 'USD'
+                r['ssi'] = ssi
+                if r['isin']:
+                    results.append(r)
+            open_text = section_text[open_deal_m.start():]
+            r2 = _parse_fab_block(open_text, cpty_name, 'new_trade', ssi)
+            if r2['isin']:
+                results.append(r2)
+            continue
 
         if fab_blocks:
             for blk_m in fab_blocks:
