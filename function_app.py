@@ -8111,37 +8111,42 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
         # ── Mixed section: "Closing Deal" table + "Open deal :" block in same email ──
         open_deal_m = _re.search(r'Open\s+deal\s*:', section_text, _re.IGNORECASE)
         if email_type == 'fully_closed' and open_deal_m:
-            close_row_m = _re.search(
-                r'-?\d+\s+([A-Z]{2}[A-Z0-9]{9,10})\s+'
-                r'([\d, ]+?)\s+'
-                r'[\d.]+%\s+\d+%\s+'
-                r'\$?\s*([\d,]+(?:\.\d+)?)\s+'
-                r'[\d.]+\s+\w+\s+'
-                r'(\d{1,2}/\d{1,2}/\d{2,4})\s+'
-                r'(\d{1,2}/\d{1,2}/\d{2,4})\s+'
-                r'([\d,]+(?:\.\d+)?)\s+'
-                r'([\d,]+(?:\.\d+)?)',
-                section_text
-            )
-            if close_row_m:
+            closing_text = section_text[:open_deal_m.start()]
+            # Find bare ISIN in closing section (no "ISIN:" prefix — it's in a table column)
+            bare_isin_m = _re.search(r'(?<![:\w])([A-Z]{2}[A-Z0-9]{9,10})\b', closing_text)
+            if bare_isin_m:
                 r = _blank()
                 r['email_type'] = 'fully_closed'
                 r['counterparty'] = cpty_name
-                r['isin'] = close_row_m.group(1)
-                r['famt_close'] = _parse_number(close_row_m.group(2))
-                r['amount_close'] = _parse_number(close_row_m.group(3))
-                r['interest'] = _parse_number(close_row_m.group(6))
-                r['net_amount'] = _parse_number(close_row_m.group(7))
-                td = _parse_date_cmf(close_row_m.group(4))
-                sd = _parse_date_cmf(close_row_m.group(5))
-                if td:
-                    r['trade_date'] = td
-                if sd:
-                    r['settlement_date'] = sd
+                r['isin'] = bare_isin_m.group(1)
                 r['currency'] = 'USD'
                 r['ssi'] = ssi
+                ctx = closing_text[bare_isin_m.end():]
+                # FAMT: first thousands-formatted integer after ISIN
+                famt_m = _re.search(r'([\d]{1,3}(?:[,\s]\d{3})+)', ctx)
+                if famt_m:
+                    r['famt_close'] = _parse_number(famt_m.group(1))
+                    r['net_nominal'] = r['famt_close']
+                # Dates: first two date-like patterns
+                dates_found = _re.findall(r'\d{1,2}/\d{1,2}/\d{2,4}', ctx)
+                if dates_found:
+                    r['trade_date'] = _parse_date_cmf(dates_found[0])
+                if len(dates_found) > 1:
+                    r['settlement_date'] = _parse_date_cmf(dates_found[1])
+                # Decimals not followed by % (excludes rate percentages like 100.7000%)
+                all_dec = [(m.group(1), _parse_number(m.group(1)))
+                           for m in _re.finditer(r'([\d,]+\.\d+)(?!\s*%)', ctx)
+                           if _parse_number(m.group(1))]
+                large = [(s, v) for s, v in all_dec if v and v > 10000]
+                small = [(s, v) for s, v in all_dec if v and 10 < v <= 10000]
+                if large:
+                    r['amount_close'] = large[0][1]
+                    r['net_amount'] = large[-1][1]
+                if small:
+                    r['interest'] = small[-1][1]
                 if r['isin']:
                     results.append(r)
+            # Parse "Open deal :" sub-section as new_trade
             open_text = section_text[open_deal_m.start():]
             r2 = _parse_fab_block(open_text, cpty_name, 'new_trade', ssi)
             if r2['isin']:
