@@ -8030,6 +8030,10 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
         elif has_new or _re.search(r'ISIN\s*:', section_text):
             email_type = 'new_trade'
         else:
+            logging.warning(
+                "CMF_PARSE section skipped (no email_type detected). cpty=%r section_preview=%r",
+                cpty_name, section_text[:300]
+            )
             continue
 
         # --- Counterparty (from section header or fallback from text) ---
@@ -8343,6 +8347,8 @@ def _process_cmf_message(
 
     parsed_list = parse_cmf_email(body_text)
     if not parsed_list:
+        preview = body_text[:300].replace('\n', ' ').strip()
+        logging.warning("CMF_PARSE no trades found. body_text preview: %s", preview)
         insert_settlement_email(
             conn=conn,
             internet_message_id=internet_message_id,
@@ -8351,7 +8357,7 @@ def _process_cmf_message(
             subject=subject,
             received_at=received_at,
             status="SKIPPED",
-            note="CMF: no data or 'No CMF movements'",
+            note=f"CMF: no trades found. Body preview: {preview[:200]}",
             mailbox=mailbox,
             attachment_count=0,
             parsed_trade_count=0,
