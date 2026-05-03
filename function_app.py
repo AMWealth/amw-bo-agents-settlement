@@ -9052,3 +9052,122 @@ def run_cmar_parser_http(req: func.HttpRequest) -> func.HttpResponse:
     finally:
         if conn:
             conn.close()
+
+
+# ── CMAR trades snapshot: daily at 15:00 UAE (11:00 UTC), Mon-Fri ─────────
+def _run_cmar_snapshot(conn) -> dict:
+    """Snapshot pending trades (query_planned_trans + value_date filter) for CMAR T+1."""
+    import datetime
+    today = datetime.date.today()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS back_office_auto.cmar_pending_trades (
+                snapshot_date     DATE    NOT NULL,
+                transfer_id       INTEGER NOT NULL,
+                deal_id           INTEGER,
+                comment           TEXT,
+                gl_account        TEXT,
+                account_number    TEXT,
+                login             INTEGER,
+                client_name       TEXT,
+                counterparty_id   INTEGER,
+                counterparty_name TEXT,
+                ssi_name          TEXT,
+                type              TEXT,
+                symbol            TEXT,
+                direction         TEXT,
+                nominal           NUMERIC,
+                value_date        DATE,
+                status            TEXT,
+                settle_date       DATE,
+                settle_type       TEXT,
+                id_settlement     INTEGER,
+                PRIMARY KEY (snapshot_date, transfer_id)
+            )
+        """)
+        cur.execute("""
+            INSERT INTO back_office_auto.cmar_pending_trades
+                (snapshot_date, transfer_id, deal_id, comment, gl_account,
+                 account_number, login, client_name, counterparty_id, counterparty_name,
+                 ssi_name, type, symbol, direction, nominal,
+                 value_date, status, settle_date, settle_type, id_settlement)
+            SELECT
+                %(snap_date)s,
+                t1.id,
+                d.id,
+                d.comment,
+                t2.account_name,
+                t2.account_number,
+                t1.login,
+                cl.name,
+                t1.counterparty_id,
+                c.short_name,
+                ssi.ssi_name,
+                t1.type,
+                t1.symbol,
+                CASE WHEN t1.nominal < 0 THEN 'PAY' ELSE 'RECEIVE' END,
+                t1.nominal,
+                t1.value_date::date,
+                s.description,
+                t1.settle_date::date,
+                t1.settle_type,
+                t1.id_settlement
+            FROM back_office.tab_transfer t1
+            LEFT JOIN back_office.tab_gl_account t2 ON t1.gl_account_id = t2.id
+            LEFT JOIN back_office.tab_standard_settlement_instructions ssi ON t1.ssi_id = ssi.id
+            LEFT JOIN back_office.tab_counterparty c ON t1.counterparty_id = c.id
+            LEFT JOIN back_office.tab_connect_deal_transfer cdt ON t1.id = cdt.id_transfer
+            LEFT JOIN back_office.tab_deals d ON cdt.id_deal = d.id
+            LEFT JOIN back_office.tab_status s ON t1.status = s.id
+            LEFT JOIN back_office.tab_client_login cl ON t1.login = cl.client_login
+            WHERE t1.status NOT IN (7, 4, 21)
+              AND t1.login NOT IN (1, 5, 1007)
+              AND t1.value_date::date = %(snap_date)s
+            ON CONFLICT (snapshot_date, transfer_id) DO NOTHING
+        """, {'snap_date': today})
+        inserted = cur.rowcount
+        conn.commit()
+    return {'snapshot_date': str(today), 'inserted': inserted}
+
+
+@app.function_name(name="cmar_trades_snapshot")
+@app.timer_trigger(schedule="0 0 11 * * 1-5", arg_name="timer", run_on_startup=False, use_monitor=False)
+def cmar_trades_snapshot(timer: func.TimerRequest) -> None:
+    conn = None
+    try:
+        conn = get_conn()
+        result = _run_cmar_snapshot(conn)
+        logging.warning("CMAR_SNAPSHOT done: %s", result)
+    except Exception as ex:
+        logging.exception("cmar_trades_snapshot failed: %s", ex)
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.function_name(name="run_cmar_snapshot")
+@app.route(route="run-cmar-snapshot", auth_level=func.AuthLevel.FUNCTION, methods=["POST"])
+def run_cmar_snapshot_http(req: func.HttpRequest) -> func.HttpResponse:
+    conn = None
+    try:
+        conn = get_conn()
+        result = _run_cmar_snapshot(conn)
+        return func.HttpResponse(
+            json.dumps({"ok": True, **result}),
+            mimetype="application/json", status_code=200,
+        )
+    except Exception as ex:
+        logging.exception("run_cmar_snapshot_http failed: %s", ex)
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        return func.HttpResponse(
+            json.dumps({"error": str(ex)}),
+            mimetype="application/json", status_code=500,
+        )
+    finally:
+        if conn:
+            conn.close()
