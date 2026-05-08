@@ -3663,7 +3663,7 @@ def parse_fab_swift_pdf(
         "BE", "LU", "PT", "GR", "CZ", "PL", "HU", "TR", "ZA", "IN",
         "CN", "KR", "TW", "MX", "BR", "AR", "CL", "CO", "AE", "SA",
         "QA", "KW", "BH", "OM", "JO", "EG", "NG", "KY", "VG", "BM",
-        "JE", "GG", "IM", "LI", "MC", "MT", "CY", "IS", "IL", "RU",
+        "JE", "GG", "IM", "LI", "MC", "MT", "CY", "IS", "IL", "RU", "AN",
     )
     _isin_alt = "|".join(_ISIN_PREFIXES)
     # ISIN is on the line immediately before :35B: (case-sensitive)
@@ -7580,7 +7580,7 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
         "BE", "LU", "PT", "GR", "CZ", "PL", "HU", "TR", "ZA", "IN",
         "CN", "KR", "TW", "MX", "BR", "AR", "CL", "CO", "AE", "SA",
         "QA", "KW", "BH", "OM", "JO", "EG", "NG", "KY", "VG", "BM",
-        "JE", "GG", "IM", "LI", "MC", "MT", "CY", "IS", "IL", "RU",
+        "JE", "GG", "IM", "LI", "MC", "MT", "CY", "IS", "IL", "RU", "AN",
     )
     _isin_alt = "|".join(_ISIN_PREFIXES)
     isin = None
