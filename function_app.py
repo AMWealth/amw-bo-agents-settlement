@@ -3901,30 +3901,22 @@ def parse_enbd_settlement_pdf(file_bytes: bytes, filename: str, email_id: int, r
 
 
 def _match_enbd_instruction(conn, client_reference: Optional[str], isin: str, settlement_date) -> Tuple[Optional[int], str, str]:
-    """Return (instruction_id, match_status, match_note). Primary key: id_amwl + isin."""
+    """Return (instruction_id, match_status, match_note). Match by ISIN + value_date.
+    client_reference (PDF 'Our Reference No') uses a different format from id_amwl so
+    is stored for display only and not used for matching.
+    """
+    if not settlement_date:
+        return (None, "NOT_FOUND", f"No settlement_date to match isin={isin}")
     with conn.cursor() as cur:
-        if client_reference:
-            cur.execute("""
-                SELECT id FROM back_office.tab_instructions
-                WHERE id_amwl = %s AND isin = %s
-                ORDER BY id DESC LIMIT 1
-            """, (client_reference, isin))
-            row = cur.fetchone()
-            if row:
-                return (row[0], "MATCHED", f"Matched by reference {client_reference}")
-
-        # Fallback: ISIN + value_date
-        if settlement_date:
-            cur.execute("""
-                SELECT id FROM back_office.tab_instructions
-                WHERE isin = %s AND value_date = %s AND status NOT IN (4, 7)
-                ORDER BY id DESC LIMIT 1
-            """, (isin, settlement_date))
-            row = cur.fetchone()
-            if row:
-                return (row[0], "MATCHED_FALLBACK", f"Matched by ISIN+date (ref not found: {client_reference})")
-
-    return (None, "NOT_FOUND", f"No instruction found for ref={client_reference} isin={isin}")
+        cur.execute("""
+            SELECT id FROM back_office.tab_instructions
+            WHERE isin = %s AND value_date = %s
+            ORDER BY id DESC LIMIT 1
+        """, (isin, settlement_date))
+        row = cur.fetchone()
+        if row:
+            return (row[0], "MATCHED", f"Matched by ISIN+date ref={client_reference}")
+    return (None, "NOT_FOUND", f"No instruction found for isin={isin} date={settlement_date}")
 
 
 def _upsert_enbd_settlement_result(conn, result: Dict[str, Any]) -> int:
