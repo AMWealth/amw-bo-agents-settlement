@@ -51,6 +51,8 @@ REPORT_TO = os.environ.get("SETTLEMENT_REPORT_TO", "k.malkova@amwealth.ae").stri
 TEST_MODE = os.environ.get("TEST_MODE", "false").strip().lower() in ("1", "true", "yes")
 TEST_EMAIL = "k.malkova@amwealth.ae"
 
+ENBD_CUSTODY_PDF_PASSWORD = "BP0012432"
+
 # Optional fallback only
 ALLOWED_SENDERS_FALLBACK = {
     "intl.email.confirms@instinet.com",
@@ -3798,6 +3800,249 @@ def _process_fab_swift_message(
     return (status, parsed_count)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ENBD EMCAP SETTLEMENT CONFIRMATION PARSER
+# Emails: enbdccustody@emiratesnbd.com / subject: EMCAP Settlement Confirmation Update
+# PDF password: BP0012432
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensure_enbd_settlement_table(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS back_office_auto.enbd_settlement_results (
+                id                        SERIAL PRIMARY KEY,
+                email_id                  INTEGER,
+                source_file               TEXT,
+                client_reference          TEXT,
+                transaction_type          TEXT,
+                isin                      TEXT,
+                quantity                  NUMERIC(20,4),
+                settlement_amount         NUMERIC(20,4),
+                settlement_currency       TEXT,
+                quantity_settled          NUMERIC(20,4),
+                settlement_date           DATE,
+                effective_settlement_date DATE,
+                match_status              TEXT,
+                match_note                TEXT,
+                instruction_id            INTEGER,
+                internal_deal_id          INTEGER,
+                settled_at                TIMESTAMP WITH TIME ZONE,
+                run_id                    INTEGER,
+                created_at                TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                CONSTRAINT enbd_settlement_results_email_id_uq UNIQUE (email_id)
+            )
+        """)
+    conn.commit()
+
+
+def parse_enbd_settlement_pdf(file_bytes: bytes, filename: str, email_id: int, run_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Extract settlement fields from ENBD EMCAP confirmation PDF (password-protected)."""
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes), password="BP0012432") as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    except Exception as e:
+        logging.warning("ENBD PDF open error file=%s: %s", filename, e)
+        return None
+
+    def _find(pattern, text=text):
+        m = re.search(pattern, text, re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    isin = _find(r"ISIN NUMBER\s*:\s*(\S+)")
+    if not isin:
+        return None
+
+    client_reference = _find(r"OUR REFERENCE NO\s*:\s*(\S+)")
+    transaction_type = _find(r"TRANSACTION TYPE\s*:\s*(.+)")
+    if transaction_type:
+        transaction_type = transaction_type.strip()
+
+    # QUANTITY SETTLED must be extracted before QUANTITY to avoid overlap
+    qty_settled_str = _find(r"QUANTITY SETTLED\s*:\s*([\d,]+(?:\.\d+)?)")
+    # QUANTITY: first occurrence that is NOT followed by ' SETTLED'
+    qty_str = _find(r"QUANTITY\s*:\s*([\d,]+(?:\.\d+)?)(?!\s*SETTLED)")
+    if not qty_str:
+        # fallback: first number after 'QUANTITY'
+        qty_str = _find(r"QUANTITY\s*:\s*([\d,]+(?:\.\d+)?)")
+
+    amount_m = re.search(r"SETTLEMENT AMOUNT\s*:\s*([A-Z]{3})\s*([\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+    settlement_currency = amount_m.group(1) if amount_m else None
+    settlement_amount_str = amount_m.group(2) if amount_m else None
+
+    sdate_str = _find(r"SETTLEMENT DATE\s*:\s*(\d{8})")
+    settlement_date = None
+    if sdate_str:
+        try:
+            settlement_date = datetime.strptime(sdate_str, "%Y%m%d").date()
+        except ValueError:
+            pass
+
+    def _parse_num(s):
+        if s is None:
+            return None
+        try:
+            return float(s.replace(",", ""))
+        except (ValueError, AttributeError):
+            return None
+
+    return {
+        "email_id": email_id,
+        "source_file": filename,
+        "client_reference": client_reference,
+        "transaction_type": transaction_type,
+        "isin": isin,
+        "quantity": _parse_num(qty_str),
+        "settlement_amount": _parse_num(settlement_amount_str),
+        "settlement_currency": settlement_currency,
+        "quantity_settled": _parse_num(qty_settled_str),
+        "settlement_date": settlement_date,
+        "run_id": run_id,
+    }
+
+
+def _match_enbd_instruction(conn, client_reference: Optional[str], isin: str, settlement_date) -> Tuple[Optional[int], str, str]:
+    """Return (instruction_id, match_status, match_note). Primary key: id_amwl + isin."""
+    with conn.cursor() as cur:
+        if client_reference:
+            cur.execute("""
+                SELECT id FROM back_office.tab_instructions
+                WHERE id_amwl = %s AND isin = %s
+                ORDER BY id DESC LIMIT 1
+            """, (client_reference, isin))
+            row = cur.fetchone()
+            if row:
+                return (row[0], "MATCHED", f"Matched by reference {client_reference}")
+
+        # Fallback: ISIN + value_date
+        if settlement_date:
+            cur.execute("""
+                SELECT id FROM back_office.tab_instructions
+                WHERE isin = %s AND value_date = %s AND status NOT IN (4, 7)
+                ORDER BY id DESC LIMIT 1
+            """, (isin, settlement_date))
+            row = cur.fetchone()
+            if row:
+                return (row[0], "MATCHED_FALLBACK", f"Matched by ISIN+date (ref not found: {client_reference})")
+
+    return (None, "NOT_FOUND", f"No instruction found for ref={client_reference} isin={isin}")
+
+
+def _upsert_enbd_settlement_result(conn, result: Dict[str, Any]) -> int:
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO back_office_auto.enbd_settlement_results
+                (email_id, source_file, client_reference, transaction_type, isin,
+                 quantity, settlement_amount, settlement_currency, quantity_settled,
+                 settlement_date, effective_settlement_date, match_status, match_note,
+                 instruction_id, run_id)
+            VALUES (%(email_id)s, %(source_file)s, %(client_reference)s, %(transaction_type)s,
+                    %(isin)s, %(quantity)s, %(settlement_amount)s, %(settlement_currency)s,
+                    %(quantity_settled)s, %(settlement_date)s, %(effective_settlement_date)s,
+                    %(match_status)s, %(match_note)s, %(instruction_id)s, %(run_id)s)
+            ON CONFLICT (email_id) DO UPDATE SET
+                source_file               = EXCLUDED.source_file,
+                client_reference          = EXCLUDED.client_reference,
+                transaction_type          = EXCLUDED.transaction_type,
+                isin                      = EXCLUDED.isin,
+                quantity                  = EXCLUDED.quantity,
+                settlement_amount         = EXCLUDED.settlement_amount,
+                settlement_currency       = EXCLUDED.settlement_currency,
+                quantity_settled          = EXCLUDED.quantity_settled,
+                settlement_date           = EXCLUDED.settlement_date,
+                effective_settlement_date = EXCLUDED.effective_settlement_date,
+                match_status              = EXCLUDED.match_status,
+                match_note                = EXCLUDED.match_note,
+                instruction_id            = EXCLUDED.instruction_id,
+                run_id                    = EXCLUDED.run_id
+            RETURNING id
+        """, result)
+        row_id = cur.fetchone()[0]
+    conn.commit()
+    return row_id
+
+
+def _process_enbd_emcap_message(
+    conn,
+    token: str,
+    mailbox: str,
+    msg: Dict[str, Any],
+    internet_message_id: str,
+    subject: str,
+    received_at,
+    processing_run_id: int,
+) -> Tuple[str, int]:
+    """Handle ENBD EMCAP Settlement Confirmation emails — parse PDFs and store results."""
+    _ensure_enbd_settlement_table(conn)
+
+    if email_already_processed(conn, internet_message_id):
+        return ("ALREADY_PROCESSED", 0)
+
+    message_id = msg["id"]
+    attachments = get_message_attachments(token, mailbox, message_id)
+
+    email_id = insert_settlement_email(
+        conn=conn,
+        internet_message_id=internet_message_id,
+        message_id=message_id,
+        sender="enbdccustody@emiratesnbd.com",
+        subject=subject,
+        received_at=received_at,
+        status="RECEIVED",
+        note="ENBD EMCAP settlement confirmation received",
+        mailbox=mailbox,
+        attachment_count=len(attachments),
+        parsed_trade_count=0,
+        processing_run_id=processing_run_id,
+    )
+
+    # effective_settlement_date = date the email was received
+    eff_date = received_at.date() if hasattr(received_at, "date") else received_at
+
+    parsed_count = 0
+    for att in attachments:
+        if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
+            continue
+        filename = att.get("name") or "unnamed"
+        if not filename.lower().endswith(".pdf"):
+            continue
+        content_b64 = att.get("contentBytes")
+        if not content_b64:
+            continue
+        file_bytes = base64.b64decode(content_b64)
+        result = parse_enbd_settlement_pdf(file_bytes, filename, email_id, processing_run_id)
+        if result and result.get("isin"):
+            instr_id, match_status, match_note = _match_enbd_instruction(
+                conn,
+                result.get("client_reference"),
+                result["isin"],
+                result.get("settlement_date"),
+            )
+            result["match_status"] = match_status
+            result["match_note"] = match_note
+            result["instruction_id"] = instr_id
+            result["internal_deal_id"] = None
+            result["effective_settlement_date"] = eff_date
+            _upsert_enbd_settlement_result(conn, result)
+            parsed_count += 1
+
+    status = "PARSED" if parsed_count > 0 else "NO_TRADES_FOUND"
+    insert_settlement_email(
+        conn=conn,
+        internet_message_id=internet_message_id,
+        message_id=message_id,
+        sender="enbdccustody@emiratesnbd.com",
+        subject=subject,
+        received_at=received_at,
+        status=status,
+        note=f"ENBD EMCAP parsed: {parsed_count}",
+        mailbox=mailbox,
+        attachment_count=len(attachments),
+        parsed_trade_count=parsed_count,
+        processing_run_id=processing_run_id,
+    )
+    return (status, parsed_count)
+
+
 def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dict[str, Any]]:
     """Match fab_swift_results against tab_deals (status IN (2,6) = INSTRUCTED or FAILED)
     by ISIN + side + settlement_date. Fallback: match without date if primary fails.
@@ -5033,6 +5278,17 @@ def process_message(
             parsed_trade_count=0,
             processing_run_id=processing_run_id,
         )
+        return ("SKIPPED", 0)
+
+    # ENBD EMCAP settlement confirmations
+    if sender == "enbdccustody@emiratesnbd.com":
+        subj_upper = (subject or "").upper()
+        if "EMCAP" in subj_upper:
+            return _process_enbd_emcap_message(
+                conn=conn, token=token, mailbox=mailbox, msg=msg,
+                internet_message_id=internet_message_id, subject=subject,
+                received_at=received_at, processing_run_id=processing_run_id,
+            )
         return ("SKIPPED", 0)
 
     # FAB SWIFT MT545/MT547: route to dedicated handler, skip normal pipeline
