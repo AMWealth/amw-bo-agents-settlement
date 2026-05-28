@@ -8616,14 +8616,16 @@ def _process_cmf_message(
     # Insert each parsed trade into tab_cmf_parsed
     with conn.cursor() as cur:
         for parsed in parsed_list:
-            # Same-email dedup by (email_id, isin, email_type): prevents duplicate rows when
-            # counterparty changes between re-parses (e.g. '' → 'FAB'), while allowing
-            # a close (fully_closed) and a new trade (new_trade) for the same ISIN in one email.
+            # Same-email dedup by (email_id, isin, email_type, trade_date): prevents duplicate rows
+            # when counterparty changes between re-parses, while allowing multiple deals for the
+            # same ISIN in one email if they have different trade_dates (e.g. 2 EC 78009 closings).
             if parsed.get('isin'):
                 cur.execute("""
                     SELECT id, counterparty FROM back_office_auto.tab_cmf_parsed
-                    WHERE email_id = %s AND isin = %s AND email_type = %s LIMIT 1
-                """, (internet_message_id, parsed['isin'], parsed.get('email_type', '')))
+                    WHERE email_id = %s AND isin = %s AND email_type = %s
+                      AND COALESCE(trade_date::text, '') = COALESCE(%s::text, '')
+                    LIMIT 1
+                """, (internet_message_id, parsed['isin'], parsed.get('email_type', ''), parsed.get('trade_date')))
                 _same = cur.fetchone()
                 if _same:
                     if not (_same[1] or '').strip() and (parsed.get('counterparty') or '').strip():
@@ -8632,14 +8634,17 @@ def _process_cmf_message(
                     continue
 
             # Dedup by ISIN + trade_date + net_amount across all emails (prevents Re:/Fwd: duplicates)
+            # Only skip if the existing record is still pending — if already instructed/settled,
+            # a combined re-send email may contain legitimate new settlement instructions.
             if parsed.get('isin') and parsed.get('trade_date') and parsed.get('net_amount'):
                 cur.execute("""
-                    SELECT id FROM back_office_auto.tab_cmf_parsed
+                    SELECT id, status FROM back_office_auto.tab_cmf_parsed
                     WHERE isin = %s AND trade_date = %s AND net_amount = %s
                     LIMIT 1
                 """, (parsed['isin'], parsed['trade_date'], parsed['net_amount']))
-                if cur.fetchone():
-                    logging.warning("CMF dedup: skipping ISIN %s trade_date %s amount %s — already exists",
+                _dup = cur.fetchone()
+                if _dup and _dup[1] in ('pending', 'review_required'):
+                    logging.warning("CMF dedup: skipping ISIN %s trade_date %s amount %s — already pending",
                                     parsed['isin'], parsed['trade_date'], parsed['net_amount'])
                     continue
 
