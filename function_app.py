@@ -8440,6 +8440,51 @@ def parse_cmf_email(body_text: str) -> List[Dict[str, Any]]:
                 prev_chunk_end = chunk_end
             continue
 
+        # ── Flat netting table: multiple Netting Instructions side-by-side (HTML columns) ──
+        # When 4 NI blocks sit in adjacent HTML cells, _strip_html merges them horizontally so all
+        # ISINs / amounts appear on a single line.  Detected by >1 ISIN + NI header + FAMT Close.
+        flat_isins = _re.findall(r'ISIN\s*:?\s*([A-Z]{2}[A-Z0-9]{9,10})', section_text)
+        if (len(flat_isins) > 1
+                and _re.search(r'Netting\s+Instruction', section_text, _re.IGNORECASE)
+                and _re.search(r'FAMT\s+Close|Wired\s+In', section_text, _re.IGNORECASE)):
+            famts  = [_parse_number(m) for m in _re.findall(
+                r'FAMT\s+Close\s*:?\s*([\d,\s.]+)', section_text, _re.IGNORECASE)]
+            ints   = [_parse_number(m) for m in _re.findall(
+                r'Interest\s*:?\s*\$?\s*([\d,\s.]+)', section_text, _re.IGNORECASE)]
+            wireds = [_parse_number(m) for m in _re.findall(
+                r'Wired\s+In\s*:?\s*\$?\s*([\d,\s.]+)', section_text, _re.IGNORECASE)]
+            tdates = [_parse_date_cmf(m) for m in _re.findall(
+                r'Trade\s+[Dd]ate\s*:?\s*([\d/.\-]+)', section_text, _re.IGNORECASE)]
+            sdates = [_parse_date_cmf(m) for m in _re.findall(
+                r'(?:^|\s)SD\s*:?\s*([\d/.\-]+)', section_text, _re.MULTILINE)]
+            ssis   = ['E/C ' + m for m in _re.findall(
+                r'(?:E/C|EC)\s*[:\s]*(\d{4,6})', section_text, _re.IGNORECASE)]
+            # Deduplicate ISINs while preserving order (a flat table may repeat the same ISIN twice
+            # in separate columns for a closing + opening leg; keep first occurrence only)
+            seen_isins = set()
+            unique_isins = []
+            for isin in flat_isins:
+                if isin not in seen_isins:
+                    seen_isins.add(isin)
+                    unique_isins.append(isin)
+            for i, isin in enumerate(unique_isins):
+                r = _blank()
+                r['email_type']      = email_type
+                r['counterparty']    = cpty_name
+                r['isin']            = isin
+                r['currency']        = 'USD'
+                r['ssi']             = ssis[i] if i < len(ssis) else ssi
+                r['famt_close']      = famts[i] if i < len(famts) else None
+                r['net_nominal']     = r['famt_close']
+                r['interest']        = ints[i] if i < len(ints) else None
+                r['net_amount']      = wireds[i] if i < len(wireds) else None
+                r['amount_close']    = r['net_amount']
+                r['trade_date']      = tdates[i] if i < len(tdates) else None
+                r['settlement_date'] = sdates[i] if i < len(sdates) else None
+                if r['isin']:
+                    results.append(r)
+            continue
+
         # ── StoneX-style: summary netting line takes priority over individual blocks ──
         # "Netting US91282CHJ36: FAMT : 5,685,000  Interest : $10,244.96  Wired in : $5,692,244.96  SD 4/10/2026"
         # When summary exists, use ONLY it (individual blocks are components, not settlement instructions)
