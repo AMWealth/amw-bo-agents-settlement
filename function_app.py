@@ -2575,8 +2575,14 @@ def parse_enbd_securities_pdf(
         side = "BUY"
         direction_phrase = buy_match
     else:
-        side = None
-        direction_phrase = None
+        # ENBDS Trade Confirmation format: direction from "Side  Sell/Buy" table column
+        side_col = rx(r"\bSide\s+(Sell|Buy)\b", text, re.IGNORECASE)
+        if side_col:
+            side = side_col.upper()
+            direction_phrase = "Side: " + side_col
+        else:
+            side = None
+            direction_phrase = None
 
     # The table data row is: OrderNo  DD-Mon-YYYY  Qty  Price  TradingAmt  DD-Mon-YYYY
     # e.g. "4008352012 02-Apr-2026 3,268 1.12000 3,660.16 06-Apr-2026"
@@ -2584,19 +2590,40 @@ def parse_enbd_securities_pdf(
         r"\b\d{7,12}\s+(\d{2}-[A-Za-z]{3}-\d{4})\s+([\d,]+)\s+([\d.]+)\s+([\d,\.]+)\s+(\d{2}-[A-Za-z]{3}-\d{4})\b",
         text,
     )
+    # ENBDS Trade Confirmation table row: Market CCY  TradeDate  ValueDate  ClientID ... Side Symbol ISIN Qty TradingAmt NetAmt ...
+    # e.g. "DFM AED 6/2/2026 6/4/2026 83304 AM WEALTH LIMITED NB23000129 Sell DUBAIRESI AEE01657D252 9196 11035.2 10,993.12 ..."
+    _enbds_row = re.search(
+        r'\b(?:DFM|ADX|NASDAQ|NYSE|LSE)\b\s+\w{3}\s+(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}/\d{1,2}/\d{4})\s+\d+\s+[^\n]*?\b(?:Sell|Buy)\b\s+\S+\s+([A-Z]{2}[A-Z0-9]{9,12})\s+([\d,]+)\s+([\d,.]+)\s+([\d,.]+)',
+        text, re.IGNORECASE,
+    )
     if _data_row:
         trade_date_raw    = _data_row.group(1)
         quantity_raw      = _data_row.group(2)
         price_raw         = _data_row.group(3)
         trading_amount_raw = _data_row.group(4)
         value_date_raw    = _data_row.group(5)
+        _prefer_mdy = False
+    elif _enbds_row:
+        # M/D/YYYY format — month-first (US/UAE date style used in DFM confirmations)
+        trade_date_raw    = _enbds_row.group(1)
+        value_date_raw    = _enbds_row.group(2)
+        quantity_raw      = _enbds_row.group(4)
+        trading_amount_raw = _enbds_row.group(5)
+        value_date_raw    = _enbds_row.group(2)
+        price_raw         = None
+        _prefer_mdy = True
+        if not isin:
+            isin = _enbds_row.group(3)
     else:
         trade_date_raw = (
             rx(r"From\s+Date\s+(\d{2}-[A-Za-z]{3}-\d{4})", text)
             or rx(r"Transaction\s+Date\s+(\d{2}-[A-Za-z]{3}-\d{4})", text)
             or rx(r"Trade\s+Date\s*[:\-]?\s*(\S+)", text)
         )
-        value_date_raw = rx(r"Settlement\s+Date\s+(\d{2}-[A-Za-z]{3}-\d{4})", text)
+        value_date_raw = (
+            rx(r"Settlement\s+Date\s+(\d{2}-[A-Za-z]{3}-\d{4})", text)
+            or rx(r"Value\s+Date\s+(\d{1,2}/\d{1,2}/\d{4})", text)
+        )
         quantity_raw = (
             rx(r"Total\s+([\d,]+)\s+[\d,\.]+", text)
             or rx(r"Quantity\s*[:\-]?\s*([\d,\.]+)", text)
@@ -2607,6 +2634,7 @@ def parse_enbd_securities_pdf(
             or rx(r"Net\s+Avg\s+Price\s+([\d.]+)", text)
         )
         trading_amount_raw = rx(r"Total\s+[\d,]+\s+([\d,\.]+)", text)
+        _prefer_mdy = bool(re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', (trade_date_raw or '').strip()))
     net_raw = (
         rx(r"\bNET\b\s*[:\-]?\s*([0-9,\.]+)", text)
         or rx(r"Net\s+Amount\s*[:\-]?\s*([0-9,\.]+)", text)
@@ -2620,8 +2648,9 @@ def parse_enbd_securities_pdf(
         or rx(r"^([0-9]{5,12})\b", text, re.MULTILINE)
     )
 
-    trade_date = parse_date_any(trade_date_raw, prefer_day_first=True)
-    value_date = parse_date_any(value_date_raw, prefer_day_first=True)
+    # _prefer_mdy=True means M/D/YYYY (US/UAE format) → prefer_day_first=False
+    trade_date = parse_date_any(trade_date_raw, prefer_day_first=not _prefer_mdy)
+    value_date = parse_date_any(value_date_raw, prefer_day_first=not _prefer_mdy)
     quantity = parse_decimal(quantity_raw)
     price = parse_decimal(price_raw)
     trading_amount = parse_decimal(trading_amount_raw)
@@ -3508,13 +3537,16 @@ def parse_pdf_file(
         has_order_report = "Order Confirmation Report" in text
         has_sell_confo = "Sell Confirmation" in text
         has_buy_confo = "Buy Confirmation" in text
+        # "ENBDS Trade Confirmation" table format (AlexandraB / DFM) — Side column, no Sell/Buy header
+        has_enbds_confo = bool(re.search(r'ENBDS\s+Trade\s+Confirmation', text, re.IGNORECASE))
+        has_side_col = bool(re.search(r'\bSide\s+(Sell|Buy)\b', text, re.IGNORECASE))
         # GCM filter: block only if sender name is explicitly non-GCM; unknown/empty = allow
         is_gcm = (not sender_name) or ("gcm" in sender_name.lower())
         logging.warning(
-            "ENBD_ROUTING sender=%s sender_name=%r file=%s order_report=%s sell_confo=%s buy_confo=%s gcm=%s",
-            sender, sender_name, filename, has_order_report, has_sell_confo, has_buy_confo, is_gcm,
+            "ENBD_ROUTING sender=%s sender_name=%r file=%s order_report=%s sell_confo=%s buy_confo=%s gcm=%s enbds=%s side_col=%s",
+            sender, sender_name, filename, has_order_report, has_sell_confo, has_buy_confo, is_gcm, has_enbds_confo, has_side_col,
         )
-        if is_gcm and (has_order_report or has_sell_confo or has_buy_confo):
+        if is_gcm and (has_order_report or has_sell_confo or has_buy_confo or has_enbds_confo or has_side_col):
             return parse_enbd_securities_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
         return parse_enbd_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
