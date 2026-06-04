@@ -293,8 +293,55 @@ def get_message_attachments(token: str, mailbox: str, message_id: str) -> List[D
     url = f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/attachments?$top=100"
     r = requests.get(url, headers=graph_headers(token), timeout=120)
     r.raise_for_status()
-    data = r.json()
-    return data.get("value", [])
+    attachments = r.json().get("value", [])
+
+    # S/MIME signed emails: Graph API /attachments returns only smime.p7s; the real PDF is
+    # embedded inside the signed MIME body.  Fall back to fetching the raw RFC-822 message
+    # via /$value and re-parsing with Python's email module to extract all real attachments.
+    has_real = any(
+        (a.get("name") or "").lower().endswith((".pdf", ".xlsx", ".xls", ".xlsm", ".zip", ".csv"))
+        for a in attachments
+    )
+    only_smime = not has_real and any(
+        (a.get("name") or "").lower().endswith((".p7s", ".p7m"))
+        for a in attachments
+    )
+    if only_smime:
+        try:
+            raw_url = f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/$value"
+            raw_r = requests.get(raw_url, headers=graph_headers(token), timeout=120)
+            raw_r.raise_for_status()
+            import email as _email_mod
+            msg = _email_mod.message_from_bytes(raw_r.content)
+            synthetic = []
+            for part in msg.walk():
+                fn = part.get_filename()
+                ct = part.get_content_type()
+                if not fn:
+                    continue
+                if fn.lower().endswith((".p7s", ".p7m")):
+                    continue
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                import base64 as _b64
+                synthetic.append({
+                    "id": None,
+                    "name": fn,
+                    "contentType": ct,
+                    "contentBytes": _b64.b64encode(payload).decode(),
+                    "_from_raw_mime": True,
+                })
+            if synthetic:
+                logging.warning(
+                    "S/MIME fallback: extracted %d attachment(s) from raw MIME for message %s",
+                    len(synthetic), message_id,
+                )
+                return synthetic
+        except Exception as _e:
+            logging.warning("S/MIME raw-MIME fallback failed for %s: %s", message_id, _e)
+
+    return attachments
 
 
 def get_message_full(token: str, mailbox: str, message_id: str) -> Dict[str, Any]:
@@ -5047,7 +5094,8 @@ def process_message_for_debug(
             filename = att.get("name") or "unnamed"
             attachment_id = att.get("id")
 
-            if odata_type != "#microsoft.graph.fileAttachment":
+            is_raw_mime = att.get("_from_raw_mime", False)
+            if not is_raw_mime and odata_type != "#microsoft.graph.fileAttachment":
                 result["attachments_processed"].append({
                     "file_name": filename,
                     "status": "SKIPPED_NON_FILE_ATTACHMENT",
@@ -5400,7 +5448,7 @@ def process_message(
         filename = att.get("name") or "unnamed"
         attachment_id = att.get("id")
 
-        if odata_type != "#microsoft.graph.fileAttachment":
+        if not att.get("_from_raw_mime") and odata_type != "#microsoft.graph.fileAttachment":
             continue
 
         content_bytes_b64 = att.get("contentBytes")
