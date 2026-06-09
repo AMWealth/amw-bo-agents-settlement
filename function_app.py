@@ -1830,6 +1830,7 @@ def parse_camcap_pdf(
     # CamCap's action is from their perspective: "CAMcap SELLS" = they sell TO us = we BUY
     _camcap_phrase = rx(r"CAMcap\s+Markets\s+Ltd\s+(SELLS|BUYS|SELL|BUY)", text)
     if _camcap_phrase:
+        direction_phrase = _camcap_phrase
         _their_side = normalize_side(_camcap_phrase, "CAMCAP_PDF")
         side = "BUY" if _their_side == "SELL" else ("SELL" if _their_side == "BUY" else None)
     else:
