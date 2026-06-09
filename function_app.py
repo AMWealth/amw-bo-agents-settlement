@@ -1874,7 +1874,7 @@ def parse_camcap_pdf(
     _total_cash = parse_decimal(total_cash_raw)
     # Guard against PDF line-split artifacts (e.g. "1" captured instead of "197,000"):
     # if total_cash is less than 50% of consideration it is likely a fragment, discard it.
-    if _total_cash and consideration and _total_cash < consideration * 0.5:
+    if _total_cash and consideration and _total_cash * 2 < consideration:
         _total_cash = None
     net_amount = _total_cash or consideration
     accrued = parse_decimal(accrued_raw)
