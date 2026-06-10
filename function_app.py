@@ -8007,10 +8007,10 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
             return parse_date_any(raw, prefer_day_first=False)
         return None
 
-    # ── Value date: :98A::VALU or :98A::PAYD ──
-    payment_date = _parse_98a("VALU")
+    # ── Value date: :98A::PAYD preferred, fall back to :98A::VALU ──
+    payment_date = _parse_98a("PAYD")
     if not payment_date:
-        payment_date = _parse_98a("PAYD")
+        payment_date = _parse_98a("VALU")
 
     # ── Trade date ──
     trade_date = None
