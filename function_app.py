@@ -4648,7 +4648,6 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                     LEFT JOIN back_office.tab_counterparty cp ON td.counterparty_id = cp.id
                     WHERE td.symbol = %s AND td.action = %s
                       AND td.status IN (2, 4, 6)
-                      AND td.login IN (1, 5)
                     ORDER BY td.id DESC LIMIT 5
                 """
                 if sett_date:
