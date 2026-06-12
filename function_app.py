@@ -3647,6 +3647,7 @@ def _ensure_fab_swift_table(conn) -> None:
             "ADD COLUMN IF NOT EXISTS linked_mt_type      TEXT",
             "ADD COLUMN IF NOT EXISTS settled_by          TEXT",
             "ADD COLUMN IF NOT EXISTS settled_at          TIMESTAMP WITH TIME ZONE",
+            "ADD COLUMN IF NOT EXISTS related_ref         TEXT",
         ]:
             cur.execute(f"ALTER TABLE back_office_auto.fab_swift_results {col_def}")
     conn.commit()
@@ -3668,8 +3669,8 @@ def _upsert_fab_swift_result(conn, result: Dict[str, Any]) -> int:
             INSERT INTO back_office_auto.fab_swift_results
                 (email_id, source_file, message_ref, mt_type, isin, security_name,
                  side, trade_date, settlement_date, effective_settlement_date,
-                 face_amount, settled_amount, settled_currency, run_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 face_amount, settled_amount, settled_currency, related_ref, run_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (email_id) DO UPDATE SET
                 source_file               = EXCLUDED.source_file,
                 message_ref               = EXCLUDED.message_ref,
@@ -3683,6 +3684,7 @@ def _upsert_fab_swift_result(conn, result: Dict[str, Any]) -> int:
                 face_amount               = EXCLUDED.face_amount,
                 settled_amount            = EXCLUDED.settled_amount,
                 settled_currency          = EXCLUDED.settled_currency,
+                related_ref               = EXCLUDED.related_ref,
                 run_id                    = EXCLUDED.run_id
             RETURNING id
         """, (
@@ -3699,6 +3701,7 @@ def _upsert_fab_swift_result(conn, result: Dict[str, Any]) -> int:
             result.get("face_amount"),
             result.get("settled_amount"),
             result.get("settled_currency"),
+            result.get("related_ref"),
             result.get("run_id"),
         ))
         row = cur.fetchone()
@@ -3712,16 +3715,22 @@ def parse_fab_swift_pdf(
     email_id: Optional[int],
     processing_run_id: Optional[int],
 ) -> Optional[Dict[str, Any]]:
-    """Parse FAB SWIFT MT545/MT547 settlement confirmation PDF.
-    MT545 = Receive Against Payment = BUY (AM Wealth receives securities)
-    MT547 = Deliver Against Payment = SELL (AM Wealth delivers securities)
+    """Parse FAB SWIFT settlement confirmation PDFs.
+    MT545 = Receive Against Payment = BUY (AM Wealth receives securities + pays cash)
+    MT547 = Deliver Against Payment = SELL (AM Wealth delivers securities + receives cash)
+    MT544 = Receive Free = BUY (AM Wealth receives securities, no cash — FOP)
+    MT546 = Deliver Free = SELL (AM Wealth delivers securities, no cash — FOP)
     """
-    # Detect MT type from text
+    # Detect MT type from text (check specific types before generic prefixes)
     mt_type = None
     if re.search(r"MT547", text):
         mt_type = "MT547"
     elif re.search(r"MT545", text):
         mt_type = "MT545"
+    elif re.search(r"MT546", text):
+        mt_type = "MT546"
+    elif re.search(r"MT544", text):
+        mt_type = "MT544"
     if not mt_type:
         return None
 
@@ -3729,12 +3738,20 @@ def parse_fab_swift_pdf(
     _debug_m = re.search(r".{0,100}:35B:.{0,300}", text, re.DOTALL)
     logging.warning("FAB_SWIFT_DEBUG file=%s | 35B_context=%r", filename, _debug_m.group(0) if _debug_m else "NOT_FOUND")
 
-    side = "BUY" if mt_type == "MT545" else "SELL"
+    # MT545/MT544 = receive (BUY); MT547/MT546 = deliver (SELL)
+    side = "BUY" if mt_type in ("MT545", "MT544") else "SELL"
 
-    # Message reference: :20C::SEME//<number> (e.g. "//2026040200217623")
+    # Message reference: :20C::SEME//<number> or bare SEME <number>
     message_ref = rx(r":20C::SEME//(\S+)", text)
     if not message_ref:
         message_ref = rx(r":20C::SEME\s+//(\S+)", text)
+    if not message_ref:
+        message_ref = rx(r":20C::SEME\s+(\S+)", text)
+
+    # Related reference (internal instruction ref, e.g. "AMW290426-20")
+    related_ref = rx(r":20C::RELA\s+(\S+)", text)
+    if not related_ref:
+        related_ref = rx(r":20C::RELA//(\S+)", text)
 
     # Dates: e.g. ":98A::TRAD Trade Date/Time 2026-02-18"
     trade_date_raw = rx(r":98A::TRAD\s+[^\n]*?(\d{4}-\d{2}-\d{2})", text)
@@ -3786,6 +3803,7 @@ def parse_fab_swift_pdf(
     face_amount = parse_decimal(face_amount_raw)
 
     # Settled amount and currency: ":19A::ESTT Settled Amount USD 479643,20"
+    # MT544/MT546 (FOP) have no settled cash amount — this field will be NULL.
     settled_currency = rx(r":19A::ESTT[^\n]*Settled Amount\s+([A-Z]{3})", text)
     settled_amount_raw = rx(r":19A::ESTT[^\n]*Settled Amount\s+[A-Z]{3}\s+([\d,]+(?:\.\d+)?)", text)
     settled_amount = None
@@ -3811,7 +3829,8 @@ def parse_fab_swift_pdf(
         "effective_settlement_date": parse_date_any(effective_date_raw),
         "face_amount": face_amount,
         "settled_amount": settled_amount,
-        "settled_currency": settled_currency or "USD",
+        "settled_currency": settled_currency or ("USD" if settled_amount is not None else None),
+        "related_ref": related_ref,
         "run_id": processing_run_id,
     }
 
@@ -3826,7 +3845,7 @@ def _process_fab_swift_message(
     received_at,
     processing_run_id: int,
 ) -> Tuple[str, int]:
-    """Handle FAB SWIFT MT545/MT547 emails — parse PDFs and store to fab_swift_results."""
+    """Handle FAB SWIFT MT545/MT547 (DVP) and MT544/MT546 (FOP) emails — parse PDFs and store to fab_swift_results."""
     _ensure_fab_swift_table(conn)
 
     if email_already_processed(conn, internet_message_id):
@@ -3843,7 +3862,7 @@ def _process_fab_swift_message(
         subject=subject,
         received_at=received_at,
         status="RECEIVED",
-        note="FAB SWIFT MT545/MT547 received",
+        note="FAB SWIFT settlement confirmation received",
         mailbox=mailbox,
         attachment_count=len(attachments),
         parsed_trade_count=0,
@@ -4120,6 +4139,329 @@ def _process_enbd_emcap_message(
     return (status, parsed_count)
 
 
+# =============================================================================
+# ENBD CA (Corporate Actions) — Payment Advice (MT566) + Entitlement Advice (MT564)
+# Emails: enbdccustody@emiratesnbd.com
+# Subjects: "Payment Advice" / "Entitlement Advice"
+# PDF password: BP0012432 (ENBD_CUSTODY_PDF_PASSWORD)
+# ENBD bug: Payment Advice PDF missing Eligible Quantity — taken from Entitlement Advice
+# =============================================================================
+
+_ENBD_CA_TYPE_MAP = {
+    "CASH DIVIDEND": "DIVIDEND",
+    "DIVIDEND": "DIVIDEND",
+    "INTEREST PAYMENT": "COUPON",
+    "COUPON PAYMENT": "COUPON",
+    "COUPON": "COUPON",
+    "FULL REDEMPTION": "FULL_REDEMPTION",
+    "EARLY REDEMPTION": "FULL_REDEMPTION",
+    "PARTIAL REDEMPTION": "PARTIAL_REDEMPTION",
+    "CALL REDEMPTION": "CALL_REDEMPTION",
+}
+
+
+def _parse_enbd_ca_date(raw: Optional[str]) -> Optional[date]:
+    """Parse ENBD PDF date formats: '11 Jun 2026', '21 May 2026'."""
+    if not raw:
+        return None
+    for fmt in ("%d %b %Y", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_enbd_payment_advice_pdf(file_bytes: bytes, filename: str) -> Optional[Dict[str, Any]]:
+    """Parse ENBD CA Payment Advice PDF — extracts amounts; eligible_quantity is absent (ENBD bug)."""
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes), password=ENBD_CUSTODY_PDF_PASSWORD) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    except Exception as e:
+        logging.warning("ENBD_CA_PAYMENT_PDF open error file=%s: %s", filename, e)
+        return None
+
+    def _find(pattern):
+        m = re.search(pattern, text, re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    ca_reference = _find(r"Corporate Action Reference\s+(\S+)")
+    if not ca_reference:
+        logging.warning("ENBD_CA_PAYMENT_PDF: no CA reference found in %s", filename)
+        return None
+
+    ca_type_raw = _find(r"Corporate Action Type\s+(.+)")
+    action_type = "DIVIDEND"
+    if ca_type_raw:
+        for key, val in _ENBD_CA_TYPE_MAP.items():
+            if key in ca_type_raw.upper():
+                action_type = val
+                break
+
+    isin = _find(r"\bISIN\s+([A-Z]{2}[A-Z0-9]{10})\b")
+
+    amt_m = re.search(r"(?:Gross|Net)\s+Amount\s+([A-Z]{3})\s+[\d,]+", text, re.IGNORECASE)
+    currency = amt_m.group(1).upper() if amt_m else None
+
+    def _parse_money(label: str) -> Optional[Decimal]:
+        m = re.search(rf"{re.escape(label)}\s+[A-Z]{{3}}\s+([\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+        if m:
+            try:
+                return Decimal(m.group(1).replace(",", ""))
+            except (ValueError, InvalidOperation):
+                pass
+        return None
+
+    gross_amount = _parse_money("Gross Amount")
+    net_amount = _parse_money("Net Amount")
+    tax_amount = _parse_money("Tax Amount")
+
+    payment_date = _parse_enbd_ca_date(_find(r"Payment Date\s+(\d{1,2}\s+\w+\s+\d{4})"))
+    record_date = _parse_enbd_ca_date(_find(r"Record Date\s+(\d{1,2}\s+\w+\s+\d{4})"))
+    cash_account = _find(r"Cash Account\s+(\S+)")
+
+    comment_map = {
+        "DIVIDEND": f"Cash Dividend | ISIN {isin or 'N/A'} | {net_amount} {currency or ''} | Pay {payment_date or 'N/A'}",
+        "COUPON": f"Interest Payment | ISIN {isin or 'N/A'} | {net_amount} {currency or ''} | Pay {payment_date or 'N/A'}",
+        "FULL_REDEMPTION": f"Full Redemption | ISIN {isin or 'N/A'} | {net_amount} {currency or ''} | Date {payment_date or 'N/A'}",
+        "PARTIAL_REDEMPTION": f"Partial Redemption | ISIN {isin or 'N/A'} | {net_amount} {currency or ''} | Date {payment_date or 'N/A'}",
+        "CALL_REDEMPTION": f"Call Redemption | ISIN {isin or 'N/A'} | {net_amount} {currency or ''} | Date {payment_date or 'N/A'}",
+    }
+    comment = comment_map.get(action_type, "")
+
+    logging.warning(
+        "ENBD_CA_PAYMENT_PARSED file=%s ref=%s type=%s isin=%s net=%s gross=%s tax=%s ccy=%s pay=%s rec=%s",
+        filename, ca_reference, action_type, isin, net_amount, gross_amount, tax_amount,
+        currency, payment_date, record_date,
+    )
+
+    return {
+        "pdf_filename": filename,
+        "seme": ca_reference,
+        "action_type": action_type,
+        "isin": isin,
+        "cash_amount": net_amount,
+        "gross_amount": gross_amount,
+        "currency": currency,
+        "payment_date": payment_date,
+        "trade_date": record_date,
+        "tax_amount": tax_amount,
+        "charges_amount": Decimal("0"),
+        "nominal": None,
+        "cash_account_iban": cash_account,
+        "account_number_key": None,
+        "gl_account_name": "NBD-CUSTODY-USD",
+        "comment": comment,
+    }
+
+
+def parse_enbd_entitlement_advice_pdf(file_bytes: bytes, filename: str) -> Optional[Dict[str, Any]]:
+    """Parse ENBD CA Entitlement Advice PDF — extracts eligible_quantity (nominal)."""
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes), password=ENBD_CUSTODY_PDF_PASSWORD) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    except Exception as e:
+        logging.warning("ENBD_CA_ENTITLEMENT_PDF open error file=%s: %s", filename, e)
+        return None
+
+    def _find(pattern):
+        m = re.search(pattern, text, re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    ca_reference = _find(r"Corporate Action Reference\s+(\S+)")
+    if not ca_reference:
+        logging.warning("ENBD_CA_ENTITLEMENT_PDF: no CA reference found in %s", filename)
+        return None
+
+    isin = _find(r"\bISIN\s+([A-Z]{2}[A-Z0-9]{10})\b")
+    qty_raw = _find(r"Eligible Quantity\s+([\d,]+(?:\.\d+)?)")
+    eligible_quantity = None
+    if qty_raw:
+        try:
+            eligible_quantity = Decimal(qty_raw.replace(",", ""))
+        except (ValueError, InvalidOperation):
+            pass
+
+    logging.warning(
+        "ENBD_CA_ENTITLEMENT_PARSED file=%s ref=%s isin=%s qty=%s",
+        filename, ca_reference, isin, eligible_quantity,
+    )
+
+    return {
+        "seme": ca_reference,
+        "isin": isin,
+        "nominal": eligible_quantity,
+        "pdf_filename": filename,
+    }
+
+
+def _upsert_enbd_ca_payment(conn, data: Dict[str, Any], received_at) -> Optional[int]:
+    """Insert or update tab_mt566_parsed with Payment Advice data.
+    Status stays 'review_required' until Entitlement Advice provides nominal."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO back_office_auto.tab_mt566_parsed
+                (received_at, pdf_filename, seme, action_type, isin,
+                 cash_amount, gross_amount, currency, payment_date, trade_date,
+                 tax_amount, charges_amount, nominal,
+                 cash_account_iban, account_number_key, gl_account_name, comment, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'review_required')
+            ON CONFLICT (seme) DO UPDATE SET
+                pdf_filename     = EXCLUDED.pdf_filename,
+                action_type      = EXCLUDED.action_type,
+                isin             = EXCLUDED.isin,
+                cash_amount      = EXCLUDED.cash_amount,
+                gross_amount     = EXCLUDED.gross_amount,
+                currency         = EXCLUDED.currency,
+                payment_date     = EXCLUDED.payment_date,
+                trade_date       = EXCLUDED.trade_date,
+                tax_amount       = EXCLUDED.tax_amount,
+                charges_amount   = EXCLUDED.charges_amount,
+                nominal          = COALESCE(back_office_auto.tab_mt566_parsed.nominal, EXCLUDED.nominal),
+                cash_account_iban = EXCLUDED.cash_account_iban,
+                gl_account_name  = EXCLUDED.gl_account_name,
+                comment          = EXCLUDED.comment,
+                status           = CASE
+                    WHEN back_office_auto.tab_mt566_parsed.nominal IS NOT NULL THEN 'pending'
+                    ELSE 'review_required'
+                END
+            WHERE back_office_auto.tab_mt566_parsed.status IN ('pending', 'review_required')
+            RETURNING id
+        """, (
+            received_at,
+            data.get("pdf_filename"),
+            data.get("seme"),
+            data.get("action_type"),
+            data.get("isin"),
+            data.get("cash_amount"),
+            data.get("gross_amount"),
+            data.get("currency"),
+            data.get("payment_date"),
+            data.get("trade_date"),
+            data.get("tax_amount"),
+            data.get("charges_amount"),
+            None,
+            data.get("cash_account_iban"),
+            data.get("account_number_key"),
+            data.get("gl_account_name"),
+            data.get("comment"),
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
+
+
+def _upsert_enbd_ca_entitlement(conn, data: Dict[str, Any], received_at) -> Optional[int]:
+    """Update tab_mt566_parsed with eligible_quantity from Entitlement Advice.
+    If no Payment Advice row exists yet, inserts a partial record."""
+    seme = data.get("seme")
+    nominal = data.get("nominal")
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE back_office_auto.tab_mt566_parsed
+            SET nominal = %s,
+                status = CASE
+                    WHEN cash_amount IS NOT NULL THEN 'pending'
+                    ELSE 'review_required'
+                END
+            WHERE seme = %s AND status IN ('pending', 'review_required')
+            RETURNING id
+        """, (nominal, seme))
+        row = cur.fetchone()
+        if row:
+            conn.commit()
+            return row[0]
+
+        # Payment Advice not yet received — insert partial record
+        cur.execute("""
+            INSERT INTO back_office_auto.tab_mt566_parsed
+                (received_at, pdf_filename, seme, isin, nominal, gl_account_name, status)
+            VALUES (%s, %s, %s, %s, %s, 'NBD-CUSTODY-USD', 'review_required')
+            ON CONFLICT (seme) DO NOTHING
+            RETURNING id
+        """, (received_at, data.get("pdf_filename"), seme, data.get("isin"), nominal))
+        row = cur.fetchone()
+        conn.commit()
+        return row[0] if row else None
+
+
+def _process_enbd_ca_message(
+    conn,
+    token: str,
+    mailbox: str,
+    msg: Dict[str, Any],
+    internet_message_id: str,
+    subject: str,
+    received_at,
+    processing_run_id: int,
+) -> Tuple[str, int]:
+    """Handle ENBD CA Payment Advice (MT566) and Entitlement Advice (MT564) emails."""
+    if email_already_processed(conn, internet_message_id):
+        return ("ALREADY_PROCESSED", 0)
+
+    subj_upper = (subject or "").upper()
+    is_entitlement = "ENTITLEMENT ADVICE" in subj_upper
+
+    message_id = msg["id"]
+    attachments = get_message_attachments(token, mailbox, message_id)
+
+    note = "ENBD CA Entitlement Advice received" if is_entitlement else "ENBD CA Payment Advice received"
+    insert_settlement_email(
+        conn=conn,
+        internet_message_id=internet_message_id,
+        message_id=message_id,
+        sender="enbdccustody@emiratesnbd.com",
+        subject=subject,
+        received_at=received_at,
+        status="RECEIVED",
+        note=note,
+        mailbox=mailbox,
+        attachment_count=len(attachments),
+        parsed_trade_count=0,
+        processing_run_id=processing_run_id,
+    )
+
+    parsed_count = 0
+    for att in attachments:
+        if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
+            continue
+        filename = att.get("name") or "unnamed"
+        if not filename.lower().endswith(".pdf"):
+            continue
+        content_b64 = att.get("contentBytes")
+        if not content_b64:
+            continue
+        file_bytes = base64.b64decode(content_b64)
+
+        if is_entitlement:
+            result = parse_enbd_entitlement_advice_pdf(file_bytes, filename)
+            if result and result.get("seme"):
+                _upsert_enbd_ca_entitlement(conn, result, received_at)
+                parsed_count += 1
+        else:
+            result = parse_enbd_payment_advice_pdf(file_bytes, filename)
+            if result and result.get("seme"):
+                _upsert_enbd_ca_payment(conn, result, received_at)
+                parsed_count += 1
+
+    status = "PARSED" if parsed_count > 0 else "NO_TRADES_FOUND"
+    insert_settlement_email(
+        conn=conn,
+        internet_message_id=internet_message_id,
+        message_id=message_id,
+        sender="enbdccustody@emiratesnbd.com",
+        subject=subject,
+        received_at=received_at,
+        status=status,
+        note=f"ENBD CA parsed: {parsed_count}",
+        mailbox=mailbox,
+        attachment_count=len(attachments),
+        parsed_trade_count=parsed_count,
+        processing_run_id=processing_run_id,
+    )
+    return (status, parsed_count)
+
+
 def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dict[str, Any]]:
     """Match fab_swift_results against tab_deals (status IN (2,6) = INSTRUCTED or FAILED)
     by ISIN + side + settlement_date. Fallback: match without date if primary fails.
@@ -4280,6 +4622,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
         side = (sw.get("side") or "").upper()
         sett_date = sw.get("settlement_date")
         action_val = 0 if side == "BUY" else 1
+        is_fop = sw.get("mt_type") in ("MT544", "MT546")
 
         # Primary: match with date
         candidates = _find_candidates(isin, action_val, sett_date) if sett_date else []
@@ -4289,12 +4632,39 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
         if not candidates:
             candidates = _find_candidates(isin, action_val, sett_date=None)
 
+        # For FOP rows, also try without reason=0 restriction (securities borrowing/transfers
+        # may have reason != 0 in tab_deals).
+        if is_fop and not candidates:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as _cur:
+                _q = """
+                    SELECT td.id, td.symbol, td.qty, td.nominal, td.transaction_value,
+                           td.action, td.status, td.login,
+                           td.settle_date_cash, td.value_date_cash,
+                           td.value_date_securities, td.settle_date_securities,
+                           td.currency_pay,
+                           td.transaction_value AS net_amount,
+                           cp.name AS counterparty
+                    FROM back_office.tab_deals td
+                    LEFT JOIN back_office.tab_counterparty cp ON td.counterparty_id = cp.id
+                    WHERE td.symbol = %s AND td.action = %s
+                      AND td.status IN (2, 4, 6)
+                      AND td.login IN (1, 5)
+                    ORDER BY td.id DESC LIMIT 5
+                """
+                if sett_date:
+                    _cur.execute(_q + " -- date filtered",
+                                 (isin, action_val))
+                else:
+                    _cur.execute(_q, (isin, action_val))
+                candidates = [dict(r) for r in _cur.fetchall()]
+                date_matched = bool(candidates) and sett_date is not None
+
         sw_amount = sw.get("settled_amount")
         sw_face = sw.get("face_amount")
 
         if not candidates:
             # Skip ISIN+side combos that have no FAB/CMF deals (login 1 or 5)
-            if (isin, action_val) not in _fab_isin_actions:
+            if not is_fop and (isin, action_val) not in _fab_isin_actions:
                 continue
             row = dict(sw)
             row["match_status"] = "NOT_FOUND"
@@ -4330,7 +4700,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
 
             int_value_date = best.get("settle_date_cash") or best.get("value_date_cash")
 
-            # Amount difference
+            # Amount difference (DVP only — FOP has no cash amount)
             amount_diff = None
             if sw_amount is not None and int_amount is not None:
                 try:
@@ -4338,7 +4708,7 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
                 except Exception:
                     pass
 
-            # Amount match: tolerance ±1 USD
+            # Amount match: tolerance ±1 USD (DVP only)
             amount_ok = (sw_amount is not None and int_amount is not None
                          and values_equal_decimal(sw_amount, int_amount, Decimal("1")))
 
@@ -4350,7 +4720,20 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
             is_cmf = best.get("login") == 5
             cmf_tag = " [CMF: matched via instruction]" if is_cmf else (" [matched via instruction]" if via_instr else "")
 
-            if not date_matched:
+            if is_fop:
+                # FOP: no cash to compare — match by face amount only
+                fop_ref = sw.get("related_ref") or ""
+                ref_tag = f" ref={fop_ref}" if fop_ref else ""
+                if not date_matched:
+                    match_status = "DATE_MISMATCH"
+                    match_note = f"FOP fallback (date {sett_date} not found); face={sw_face} vs system={int_face}{ref_tag}{cmf_tag}"
+                elif face_ok:
+                    match_status = "MATCHED"
+                    match_note = f"FOP face OK{ref_tag}{cmf_tag}" if (ref_tag or cmf_tag) else None
+                else:
+                    match_status = "FACE_MISMATCH"
+                    match_note = f"FOP face={sw_face} vs system={int_face}{ref_tag}{cmf_tag}"
+            elif not date_matched:
                 match_status = "DATE_MISMATCH"
                 diff_str = f" Δ={amount_diff:+.2f}" if amount_diff is not None else ""
                 match_note = f"Fallback match (date {sett_date} not found); settled={sw_amount} vs internal={int_amount}{diff_str}{cmf_tag}"
@@ -5367,12 +5750,19 @@ def process_message(
                 internet_message_id=internet_message_id, subject=subject,
                 received_at=received_at, processing_run_id=processing_run_id,
             )
+        if "PAYMENT ADVICE" in subj_upper or "ENTITLEMENT ADVICE" in subj_upper:
+            return _process_enbd_ca_message(
+                conn=conn, token=token, mailbox=mailbox, msg=msg,
+                internet_message_id=internet_message_id, subject=subject,
+                received_at=received_at, processing_run_id=processing_run_id,
+            )
         return ("SKIPPED", 0)
 
-    # FAB SWIFT MT545/MT547: route to dedicated handler, skip normal pipeline
+    # FAB SWIFT MT545/MT547 (DVP) and MT544/MT546 (FOP): route to dedicated handler
     if sender == "noreply@bankfab.com":
         subj_upper = (subject or "").upper()
-        if "MT545" in subj_upper or "MT547" in subj_upper:
+        if ("MT545" in subj_upper or "MT547" in subj_upper
+                or "MT544" in subj_upper or "MT546" in subj_upper):
             return _process_fab_swift_message(
                 conn=conn, token=token, mailbox=mailbox, msg=msg,
                 internet_message_id=internet_message_id, subject=subject,
@@ -6594,10 +6984,10 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
     for col_idx, _ in enumerate(hdr3, 1):
         ws3.column_dimensions[get_column_letter(col_idx)].width = 18
 
-    # ── Sheet 4: FAB SWIFT MT545/MT547 ────────────────────────────────────────
+    # ── Sheet 4: FAB SWIFT MT545/MT547/MT544/MT546 ───────────────────────────
     fab_swift_rows = result.get("fab_swift_rows", [])
     if fab_swift_rows:
-        ws4 = wb.create_sheet("FAB SWIFT MT545-MT547")
+        ws4 = wb.create_sheet("FAB SWIFT MT544-MT547")
         hdr4 = [
             "ISIN", "Side", "Match", "Internal Deal",
             "MT", "Sett. Date", "Eff. Sett. (PDF)",
@@ -6844,7 +7234,7 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
     # ── Table D: FAB SWIFT MT545/MT547 Settlement Confirmations ──────────────
     fab_swift_rows = result.get("fab_swift_rows", [])
     if fab_swift_rows:
-        html += f"""<div class="sect">D. FAB SWIFT Settlement Confirmations — MT545/MT547 ({len(fab_swift_rows)})</div>
+        html += f"""<div class="sect">D. FAB SWIFT Settlement Confirmations — MT544/MT545/MT546/MT547 ({len(fab_swift_rows)})</div>
 <table>
 <tr>
   <th>ISIN</th><th>Side</th><th>Match</th><th>Internal Deal</th>
