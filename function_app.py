@@ -3741,12 +3741,12 @@ def parse_fab_swift_pdf(
     # MT545/MT544 = receive (BUY); MT547/MT546 = deliver (SELL)
     side = "BUY" if mt_type in ("MT545", "MT544") else "SELL"
 
-    # Message reference: :20C::SEME//<number> or bare SEME <number>
-    message_ref = rx(r":20C::SEME//(\S+)", text)
+    # Message reference: FAB PDFs render as ":20C::SEME Sender's Message Reference 2026042902165833"
+    message_ref = rx(r":20C::SEME\b[^\n]*Message Reference\s+(\S+)", text)
+    if not message_ref:
+        message_ref = rx(r":20C::SEME//(\S+)", text)
     if not message_ref:
         message_ref = rx(r":20C::SEME\s+//(\S+)", text)
-    if not message_ref:
-        message_ref = rx(r":20C::SEME\s+(\S+)", text)
 
     # Related reference (internal instruction ref, e.g. "AMW290426-20")
     related_ref = rx(r":20C::RELA\s+(\S+)", text)
