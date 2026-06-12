@@ -4675,6 +4675,15 @@ def run_fab_swift_reconciliation(conn, run_id: Optional[int] = None) -> List[Dic
             row["amount_diff"] = None
             row["face_amount_match"] = None
             row["counterparty"] = None
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE back_office_auto.fab_swift_results
+                    SET match_status = 'NOT_FOUND',
+                        match_note = 'No INSTRUCTED/FAILED deal found for ISIN+side',
+                        run_id = %s
+                    WHERE id = %s
+                """, (run_id, sw["id"]))
+            conn.commit()
         else:
             # Filter out deals already claimed by a previous SWIFT row (duplicate ISIN handling)
             available = [c for c in candidates if c['id'] not in claimed_deal_ids]
