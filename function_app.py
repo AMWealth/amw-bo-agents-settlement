@@ -8291,8 +8291,8 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
 
     # Detect action type via :22F::CAEV field
     action_type = None
-    caev = rx(r":22F::CAEV[^\n]*(Interest Payment|Cash Dividend|Full Redemption|"
-              r"Partial Redemption|Call Redemption|Full Call|Early Redemption)", text)
+    caev = rx(r":22F::CAEV[^\n]*(Interest Payment|Cash Dividend|Dividend Reinvestment|"
+              r"Full Redemption|Partial Redemption|Call Redemption|Full Call|Early Redemption)", text)
     if caev:
         caev_upper = caev.upper()
         if "INTEREST" in caev_upper:
@@ -8318,7 +8318,7 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
             action_type = "CALL_REDEMPTION"
         elif re.search(r"INTEREST\s+PAYMENT", text_upper):
             action_type = "COUPON"
-        elif re.search(r"CASH\s+DIVIDEND", text_upper):
+        elif re.search(r"CASH\s+DIVIDEND|DIVIDEND\s+REINVESTMENT", text_upper):
             action_type = "DIVIDEND"
 
     if not action_type:
