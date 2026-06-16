@@ -8,7 +8,7 @@ import base64
 import hashlib
 import zipfile
 from datetime import datetime, timedelta, timezone, date
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 import azure.functions as func
@@ -4220,6 +4220,19 @@ def parse_enbd_payment_advice_pdf(file_bytes: bytes, filename: str) -> Optional[
     record_date = _parse_enbd_ca_date(_find(r"Record Date\s+(\d{1,2}\s+\w+\s+\d{4})"))
     cash_account = _find(r"Cash Account\s+(\S+)")
 
+    # Derive eligible quantity from Cash Rate (DIVIDEND: shares = gross / rate_per_share).
+    # Payment Advice has "Cash Rate USD 0.53" but no Eligible Quantity field (ENBD bug).
+    # This avoids waiting for the separate Entitlement Advice email.
+    cash_rate_raw = _find(r"Cash Rate\s+[A-Z]{3}\s+([\d.,]+)")
+    nominal = None
+    if cash_rate_raw and gross_amount and action_type == "DIVIDEND":
+        try:
+            rate = Decimal(cash_rate_raw.replace(",", ""))
+            if rate > 0:
+                nominal = (gross_amount / rate).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        except (ValueError, InvalidOperation, ZeroDivisionError):
+            pass
+
     comment_map = {
         "DIVIDEND": f"Cash Dividend | ISIN {isin or 'N/A'} | {net_amount} {currency or ''} | Pay {payment_date or 'N/A'}",
         "COUPON": f"Interest Payment | ISIN {isin or 'N/A'} | {net_amount} {currency or ''} | Pay {payment_date or 'N/A'}",
@@ -4230,9 +4243,9 @@ def parse_enbd_payment_advice_pdf(file_bytes: bytes, filename: str) -> Optional[
     comment = comment_map.get(action_type, "")
 
     logging.warning(
-        "ENBD_CA_PAYMENT_PARSED file=%s ref=%s type=%s isin=%s net=%s gross=%s tax=%s ccy=%s pay=%s rec=%s",
+        "ENBD_CA_PAYMENT_PARSED file=%s ref=%s type=%s isin=%s net=%s gross=%s tax=%s ccy=%s pay=%s rec=%s cash_rate=%s nominal=%s",
         filename, ca_reference, action_type, isin, net_amount, gross_amount, tax_amount,
-        currency, payment_date, record_date,
+        currency, payment_date, record_date, cash_rate_raw, nominal,
     )
 
     return {
@@ -4247,7 +4260,7 @@ def parse_enbd_payment_advice_pdf(file_bytes: bytes, filename: str) -> Optional[
         "trade_date": record_date,
         "tax_amount": tax_amount,
         "charges_amount": Decimal("0"),
-        "nominal": None,
+        "nominal": nominal,
         "cash_account_iban": cash_account,
         "account_number_key": None,
         "gl_account_name": "NBD-CUSTODY-USD",
@@ -4274,7 +4287,11 @@ def parse_enbd_entitlement_advice_pdf(file_bytes: bytes, filename: str) -> Optio
         return None
 
     isin = _find(r"\bISIN\s+([A-Z]{2}[A-Z0-9]{10})\b")
-    qty_raw = _find(r"Eligible Quantity\s+([\d,]+(?:\.\d+)?)")
+    qty_raw = (
+        _find(r"Eligible Quantity\s+([\d,]+(?:\.\d+)?)")
+        or _find(r"Eligible Balance\s+([\d,]+(?:\.\d+)?)")
+        or _find(r"Entitled Quantity\s+([\d,]+(?:\.\d+)?)")
+    )
     eligible_quantity = None
     if qty_raw:
         try:
@@ -4297,7 +4314,9 @@ def parse_enbd_entitlement_advice_pdf(file_bytes: bytes, filename: str) -> Optio
 
 def _upsert_enbd_ca_payment(conn, data: Dict[str, Any], received_at) -> Optional[int]:
     """Insert or update tab_mt566_parsed with Payment Advice data.
-    Status stays 'review_required' until Entitlement Advice provides nominal."""
+    nominal is derived from Cash Rate when possible; status 'pending' when nominal is set."""
+    nominal = data.get("nominal")
+    initial_status = 'pending' if nominal is not None else 'review_required'
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO back_office_auto.tab_mt566_parsed
@@ -4305,7 +4324,7 @@ def _upsert_enbd_ca_payment(conn, data: Dict[str, Any], received_at) -> Optional
                  cash_amount, gross_amount, currency, payment_date, trade_date,
                  tax_amount, charges_amount, nominal,
                  cash_account_iban, account_number_key, gl_account_name, comment, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'review_required')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (seme) DO UPDATE SET
                 pdf_filename     = EXCLUDED.pdf_filename,
                 action_type      = EXCLUDED.action_type,
@@ -4322,7 +4341,7 @@ def _upsert_enbd_ca_payment(conn, data: Dict[str, Any], received_at) -> Optional
                 gl_account_name  = EXCLUDED.gl_account_name,
                 comment          = EXCLUDED.comment,
                 status           = CASE
-                    WHEN back_office_auto.tab_mt566_parsed.nominal IS NOT NULL THEN 'pending'
+                    WHEN COALESCE(back_office_auto.tab_mt566_parsed.nominal, EXCLUDED.nominal) IS NOT NULL THEN 'pending'
                     ELSE 'review_required'
                 END
             WHERE back_office_auto.tab_mt566_parsed.status IN ('pending', 'review_required')
@@ -4340,11 +4359,12 @@ def _upsert_enbd_ca_payment(conn, data: Dict[str, Any], received_at) -> Optional
             data.get("trade_date"),
             data.get("tax_amount"),
             data.get("charges_amount"),
-            None,
+            nominal,
             data.get("cash_account_iban"),
             data.get("account_number_key"),
             data.get("gl_account_name"),
             data.get("comment"),
+            initial_status,
         ))
         row = cur.fetchone()
         conn.commit()
@@ -4359,7 +4379,7 @@ def _upsert_enbd_ca_entitlement(conn, data: Dict[str, Any], received_at) -> Opti
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE back_office_auto.tab_mt566_parsed
-            SET nominal = %s,
+            SET nominal = COALESCE(%s, nominal),
                 status = CASE
                     WHEN cash_amount IS NOT NULL THEN 'pending'
                     ELSE 'review_required'
