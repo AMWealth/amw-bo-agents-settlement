@@ -5828,12 +5828,6 @@ def process_message(
                 internet_message_id=internet_message_id, subject=subject,
                 received_at=received_at, processing_run_id=processing_run_id,
             )
-        if "MT564" in subj_upper or "PAYMENT CONFIRMATION" in subj_upper:
-            return _process_mt564_message(
-                conn=conn, token=token, mailbox=mailbox, msg=msg,
-                internet_message_id=internet_message_id, subject=subject,
-                received_at=received_at, processing_run_id=processing_run_id,
-            )
         return ("SKIPPED", 0)
 
     if sender == "bo.tdsm@zarattinibank.ch" and "confirmation" not in subject.lower():
@@ -8317,8 +8311,8 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
 
     # Detect action type via :22F::CAEV field
     action_type = None
-    caev = rx(r":22F::CAEV[^\n]*(Interest Payment|Cash Dividend|Dividend Reinvestment|"
-              r"Full Redemption|Partial Redemption|Call Redemption|Full Call|Early Redemption)", text)
+    caev = rx(r":22F::CAEV[^\n]*(Interest Payment|Cash Dividend|Full Redemption|"
+              r"Partial Redemption|Call Redemption|Full Call|Early Redemption)", text)
     if caev:
         caev_upper = caev.upper()
         if "INTEREST" in caev_upper:
@@ -8344,7 +8338,7 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
             action_type = "CALL_REDEMPTION"
         elif re.search(r"INTEREST\s+PAYMENT", text_upper):
             action_type = "COUPON"
-        elif re.search(r"CASH\s+DIVIDEND|DIVIDEND\s+REINVESTMENT", text_upper):
+        elif re.search(r"CASH\s+DIVIDEND", text_upper):
             action_type = "DIVIDEND"
 
     if not action_type:
@@ -8446,48 +8440,6 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
             nominal_raw = nominal_raw.replace(",", "")
         nominal = parse_decimal(nominal_raw)
 
-    # ── MT564 DRIP fallback: :19B::ENTL (gross) + :92F::NETT rate → net / tax ──
-    # MT564 uses ENTL for total entitled gross and 92F::NETT for per-unit net rate;
-    # standard MT566 fields (NETT/GRSS) are absent in MT564 PDFs.
-    if cash_amount is None or gross_amount is None:
-        _, entl_amount = _parse_19b("ENTL")
-        if entl_amount is not None:
-            if gross_amount is None:
-                gross_amount = entl_amount
-            if not currency:
-                m_entl_ccy = re.search(
-                    r":19B::ENTL\b[^\n]*?\b([A-Z]{3})\b", text, re.IGNORECASE
-                )
-                if m_entl_ccy:
-                    currency = m_entl_ccy.group(1).upper()
-            # Net = nominal × per-unit net dividend rate
-            if cash_amount is None and nominal:
-                m_92f = re.search(
-                    r":92F::NETT\b[^\n]*?\b([A-Z]{3})\s+([\d,\.]+)", text, re.IGNORECASE
-                )
-                if m_92f:
-                    rate_raw = m_92f.group(2).rstrip(",")
-                    # Single comma = European decimal separator (e.g. "0,2380000000000")
-                    if rate_raw.count(",") == 1 and "." not in rate_raw:
-                        rate_raw = rate_raw.replace(",", ".")
-                    else:
-                        rate_raw = rate_raw.replace(",", "")
-                    net_rate = parse_decimal(rate_raw)
-                    if net_rate:
-                        cash_amount = (net_rate * nominal).quantize(Decimal("0.01"))
-                        if not currency:
-                            currency = m_92f.group(1).upper()
-            # Tax from ADTX narrative: TAXR//15, (percentage)
-            if (cash_amount is not None and gross_amount is not None
-                    and tax_amount == Decimal("0")):
-                m_taxr_pct = re.search(r"TAXR//(\d+(?:[,\.]\d+)?)", text, re.IGNORECASE)
-                if m_taxr_pct:
-                    taxr_pct = parse_decimal(m_taxr_pct.group(1).replace(",", "."))
-                    if taxr_pct:
-                        tax_amount = (
-                            gross_amount * taxr_pct / Decimal("100")
-                        ).quantize(Decimal("0.01"))
-
     # ── Helper: parse :98A:: dates ──
     def _parse_98a(tag: str) -> Optional[date]:
         raw = rx(rf":98A::{tag}\s*//(\d{{8}})", text)
@@ -8549,11 +8501,6 @@ def parse_mt566_pdf(text: str, filename: str) -> Optional[Dict[str, Any]]:
         filename, action_type, isin, cash_amount, currency, tax_amount, charges_amount,
         nominal, trade_date, payment_date, cash_account_iban, seme,
     )
-
-    # Skip narrative-only PDFs (e.g. MT568) that carry no bookable amounts
-    if cash_amount is None and gross_amount is None:
-        logging.warning("MT566_PARSER: no amounts found in %s — skipping (likely MT568 narrative)", filename)
-        return None
 
     # Auto-generate comment
     amount_str = f"{cash_amount:,.2f} {currency}" if cash_amount and currency else "N/A"
@@ -8726,88 +8673,6 @@ def _process_mt566_message(
         received_at=received_at,
         status=status,
         note=f"MT566 parsed: {parsed_count}",
-        mailbox=mailbox,
-        attachment_count=len(attachments),
-        parsed_trade_count=parsed_count,
-        processing_run_id=processing_run_id,
-    )
-    return (status, parsed_count)
-
-
-def _process_mt564_message(
-    conn,
-    token: str,
-    mailbox: str,
-    msg: Dict[str, Any],
-    internet_message_id: str,
-    subject: str,
-    received_at,
-    processing_run_id: int,
-) -> Tuple[str, int]:
-    """Handle FAB MT564 / Payment Confirmation emails for DRIP choice dividends.
-    Loops all PDF attachments; only MT564-format PDFs with bookable amounts are saved."""
-    if email_already_processed(conn, internet_message_id):
-        return ("ALREADY_PROCESSED", 0)
-
-    message_id = msg["id"]
-    attachments = get_message_attachments(token, mailbox, message_id)
-
-    insert_settlement_email(
-        conn=conn,
-        internet_message_id=internet_message_id,
-        message_id=message_id,
-        sender="noreply@bankfab.com",
-        subject=subject,
-        received_at=received_at,
-        status="RECEIVED",
-        note="FAB MT564/Payment Confirmation received",
-        mailbox=mailbox,
-        attachment_count=len(attachments),
-        parsed_trade_count=0,
-        processing_run_id=processing_run_id,
-    )
-
-    parsed_count = 0
-    for att in attachments:
-        if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
-            continue
-        filename = att.get("name") or "unnamed"
-        if not filename.lower().endswith(".pdf"):
-            continue
-        content_b64 = att.get("contentBytes")
-        if not content_b64:
-            continue
-        file_bytes = base64.b64decode(content_b64)
-        text = extract_pdf_text(file_bytes)
-        result = parse_mt566_pdf(text, filename)
-        if not result:
-            logging.info("MT564: skipped %s (no bookable amounts)", filename)
-            continue
-
-        result["received_at"] = received_at
-        gl_account_name = _lookup_gl_account(conn, result.get("account_number_key"))
-        result["gl_account_name"] = gl_account_name
-        result["status"] = "pending" if gl_account_name else "review_required"
-
-        if not gl_account_name:
-            logging.warning(
-                "MT564: GL account not found for IBAN key=%s, file=%s",
-                result.get("account_number_key"), filename,
-            )
-
-        _insert_mt566_parsed(conn, result)
-        parsed_count += 1
-
-    status = "PARSED" if parsed_count > 0 else "NO_TRADES_FOUND"
-    insert_settlement_email(
-        conn=conn,
-        internet_message_id=internet_message_id,
-        message_id=message_id,
-        sender="noreply@bankfab.com",
-        subject=subject,
-        received_at=received_at,
-        status=status,
-        note=f"MT564 DRIP parsed: {parsed_count}",
         mailbox=mailbox,
         attachment_count=len(attachments),
         parsed_trade_count=parsed_count,
