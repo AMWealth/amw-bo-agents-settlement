@@ -2882,10 +2882,25 @@ def parse_seaport_pdf(
     email_id: Optional[int],
     broker_name: str,
 ) -> List[Dict[str, Any]]:
-    # Format: single data row after 3-line header block
-    # Columns: Side  ISIN  Quantity  Price  SettlDate  NetConsideration  Ccy  Accrued  GrossConsideration  TradeDate  InstrumentName
-    # Example: "Buy XS0701227075 200000 116.75 17/02/2026 -237548.61 USD 4048.6100 -233500 12/02/2026 AM WEALTH ..."
-    pattern = re.compile(
+    # Two Seaport PDF formats:
+    # Old: Side ISIN Qty Price SettlDate Net Ccy Accrued Gross TradeDate InstrumentName
+    #   "Buy XS0701227075 200000 116.75 17/02/2026 -237548.61 USD 4048.6100 -233500 12/02/2026 AM WEALTH ..."
+    # New (from ~Jun 2026): Ccy moved before SettlDate, AcrDays column added, GrossConsideration removed
+    #   "Sell XS1993965950 -200000 103.375 USD 18/06/2026 207872.92 33 1122.9200 16/06/2026 AM WEALTH ..."
+    pattern_new = re.compile(
+        r"^(Buy|Sell)\s+"
+        r"([A-Z]{2}[A-Z0-9]{9,12})\s+"
+        r"(-?[\d,]+)\s+"           # quantity
+        r"(-?[\d.]+)\s+"           # price
+        r"([A-Z]{3})\s+"           # currency (before settlement date in new format)
+        r"(\d{2}/\d{2}/\d{4})\s+"  # settlement date
+        r"(-?[\d,.]+)\s+"          # net consideration
+        r"\d+\s+"                  # accrued interest days (integer, skip)
+        r"(-?[\d,.]+)\s+"          # accrued interest amount
+        r"(\d{2}/\d{2}/\d{4})",    # trade date
+        re.IGNORECASE | re.MULTILINE,
+    )
+    pattern_old = re.compile(
         r"^(Buy|Sell)\s+"
         r"([A-Z]{2}[A-Z0-9]{9,12})\s+"
         r"(-?[\d,]+)\s+"           # quantity
@@ -2900,8 +2915,25 @@ def parse_seaport_pdf(
     )
 
     rows: List[Dict[str, Any]] = []
-    for m in pattern.finditer(text):
-        side_raw, isin, qty_raw, price_raw, settle_raw, net_raw, ccy, accrued_raw, gross_raw, trade_raw = m.groups()
+
+    matches_new = list(pattern_new.finditer(text))
+    use_new_fmt = bool(matches_new)
+    matches = matches_new if use_new_fmt else list(pattern_old.finditer(text))
+
+    our_ssi_raw = rx(r"OUR\s+SSI\s*:\s*(?:ECLR|EUROCLEAR|DTC|CEDE)\s+(\w+)", text)
+
+    for m in matches:
+        if use_new_fmt:
+            side_raw, isin, qty_raw, price_raw, ccy, settle_raw, net_raw, accrued_raw, trade_raw = m.groups()
+            net_amount = parse_decimal(net_raw)
+            accrued = parse_decimal(accrued_raw)
+            # gross = principal = net - accrued (sign-consistent)
+            consideration = (net_amount - accrued) if (net_amount is not None and accrued is not None) else net_amount
+        else:
+            side_raw, isin, qty_raw, price_raw, settle_raw, net_raw, ccy, accrued_raw, gross_raw, trade_raw = m.groups()
+            net_amount = parse_decimal(net_raw)
+            accrued = parse_decimal(accrued_raw)
+            consideration = parse_decimal(gross_raw)
 
         # Instrument name: rest of the line after trade date
         rest = text[m.end():].split("\n")[0].strip()
@@ -2911,17 +2943,11 @@ def parse_seaport_pdf(
         value_date = parse_date_any(settle_raw, prefer_day_first=True)
         quantity = parse_decimal(qty_raw)
         price = parse_decimal(price_raw)
-        net_amount = parse_decimal(net_raw)
-        consideration = parse_decimal(gross_raw)
-        accrued = parse_decimal(accrued_raw)
         # Seaport confirmation shows Seaport's action: "Buy" = Seaport buys FROM AM Wealth = AM Wealth SELLS
         _seaport_side = normalize_side(side_raw, "SEAPORT_PDF")
         side = "SELL" if _seaport_side == "BUY" else ("BUY" if _seaport_side == "SELL" else _seaport_side)
 
         ref = build_generic_reference(isin, side, trade_date, value_date, quantity, price)
-
-        # Extract "OUR SSI : ECLR 75663" → account for enrich_cpty_ssi matching
-        our_ssi_raw = rx(r"OUR\s+SSI\s*:\s*(?:ECLR|EUROCLEAR|DTC|CEDE)\s+(\w+)", text)
 
         trade = build_trade_dict(
             internet_message_id=internet_message_id,
@@ -2950,9 +2976,9 @@ def parse_seaport_pdf(
                 "side_raw": side_raw, "isin": isin,
                 "qty_raw": qty_raw, "price_raw": price_raw,
                 "settle_raw": settle_raw, "trade_raw": trade_raw,
-                "net_raw": net_raw, "gross_raw": gross_raw,
-                "accrued_raw": accrued_raw, "ccy": ccy,
+                "net_raw": net_raw, "accrued_raw": accrued_raw, "ccy": ccy,
                 "our_ssi_raw": our_ssi_raw,
+                "fmt": "new" if use_new_fmt else "old",
             }, default=str),
             processing_run_id=processing_run_id,
             file_id=file_id,
@@ -2965,7 +2991,7 @@ def parse_seaport_pdf(
         finalize_trade_validation(trade, email_received_at)
         rows.append(trade)
 
-    logging.info("SEAPORT PDF parsed rows=%s", len(rows))
+    logging.info("SEAPORT PDF parsed rows=%s fmt=%s", len(rows), "new" if use_new_fmt else "old")
     return rows
 
 
