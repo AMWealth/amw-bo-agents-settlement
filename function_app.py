@@ -4316,7 +4316,11 @@ def parse_enbd_entitlement_advice_pdf(file_bytes: bytes, filename: str) -> Optio
         logging.warning("ENBD_CA_ENTITLEMENT_PDF: no CA reference found in %s", filename)
         return None
 
-    isin = _find(r"\bISIN\s+([A-Z]{2}[A-Z0-9]{10})\b")
+    # ENBD sometimes uses "Company" instead of "ISIN" as the label (format changed Jun 2026)
+    isin = (
+        _find(r"\bISIN\s+([A-Z]{2}[A-Z0-9]{10})\b")
+        or _find(r"\bCompany\s+([A-Z]{2}[A-Z0-9]{10})\b")
+    )
     qty_raw = (
         _find(r"Eligible Quantity\s+([\d,]+(?:\.\d+)?)")
         or _find(r"Eligible Balance\s+([\d,]+(?:\.\d+)?)")
@@ -4329,15 +4333,24 @@ def parse_enbd_entitlement_advice_pdf(file_bytes: bytes, filename: str) -> Optio
         except (ValueError, InvalidOperation):
             pass
 
+    ca_type_raw = _find(r"Corporate Action Type\s+(.+)")
+    action_type = "DIVIDEND"
+    if ca_type_raw:
+        for key, val in _ENBD_CA_TYPE_MAP.items():
+            if key in ca_type_raw.upper():
+                action_type = val
+                break
+
     logging.warning(
-        "ENBD_CA_ENTITLEMENT_PARSED file=%s ref=%s isin=%s qty=%s",
-        filename, ca_reference, isin, eligible_quantity,
+        "ENBD_CA_ENTITLEMENT_PARSED file=%s ref=%s isin=%s qty=%s type=%s",
+        filename, ca_reference, isin, eligible_quantity, action_type,
     )
 
     return {
         "seme": ca_reference,
         "isin": isin,
         "nominal": eligible_quantity,
+        "action_type": action_type,
         "pdf_filename": filename,
     }
 
@@ -4425,11 +4438,12 @@ def _upsert_enbd_ca_entitlement(conn, data: Dict[str, Any], received_at) -> Opti
         # Payment Advice not yet received — insert partial record
         cur.execute("""
             INSERT INTO back_office_auto.tab_mt566_parsed
-                (received_at, pdf_filename, seme, isin, nominal, gl_account_name, status)
-            VALUES (%s, %s, %s, %s, %s, 'NBD-CUSTODY-USD', 'review_required')
+                (received_at, pdf_filename, seme, isin, action_type, nominal, gl_account_name, status)
+            VALUES (%s, %s, %s, %s, %s, %s, 'NBD-CUSTODY-USD', 'review_required')
             ON CONFLICT (seme) DO NOTHING
             RETURNING id
-        """, (received_at, data.get("pdf_filename"), seme, data.get("isin"), nominal))
+        """, (received_at, data.get("pdf_filename"), seme, data.get("isin"),
+              data.get("action_type", "DIVIDEND"), nominal))
         row = cur.fetchone()
         conn.commit()
         return row[0] if row else None
