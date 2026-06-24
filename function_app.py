@@ -4224,7 +4224,11 @@ def parse_enbd_payment_advice_pdf(file_bytes: bytes, filename: str) -> Optional[
                 action_type = val
                 break
 
-    isin = _find(r"\bISIN\s+([A-Z]{2}[A-Z0-9]{10})\b")
+    # ENBD sometimes uses "Company" instead of "ISIN" as the label (format changed Jun 2026)
+    isin = (
+        _find(r"\bISIN\s+([A-Z]{2}[A-Z0-9]{10})\b")
+        or _find(r"\bCompany\s+([A-Z]{2}[A-Z0-9]{10})\b")
+    )
 
     amt_m = re.search(r"(?:Gross|Net)\s+Amount\s+([A-Z]{3})\s+[\d,]+", text, re.IGNORECASE)
     currency = amt_m.group(1).upper() if amt_m else None
