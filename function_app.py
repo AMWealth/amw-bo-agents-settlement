@@ -4368,10 +4368,9 @@ def _upsert_enbd_ca_payment(conn, data: Dict[str, Any], received_at) -> Optional
                  tax_amount, charges_amount, nominal,
                  cash_account_iban, account_number_key, gl_account_name, comment, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (seme) DO UPDATE SET
+            ON CONFLICT (seme, isin) DO UPDATE SET
                 pdf_filename     = EXCLUDED.pdf_filename,
                 action_type      = EXCLUDED.action_type,
-                isin             = EXCLUDED.isin,
                 cash_amount      = EXCLUDED.cash_amount,
                 gross_amount     = EXCLUDED.gross_amount,
                 currency         = EXCLUDED.currency,
@@ -4420,6 +4419,7 @@ def _upsert_enbd_ca_entitlement(conn, data: Dict[str, Any], received_at) -> Opti
     seme = data.get("seme")
     nominal = data.get("nominal")
     with conn.cursor() as cur:
+        isin = data.get("isin")
         cur.execute("""
             UPDATE back_office_auto.tab_mt566_parsed
             SET nominal = COALESCE(%s, nominal),
@@ -4427,9 +4427,9 @@ def _upsert_enbd_ca_entitlement(conn, data: Dict[str, Any], received_at) -> Opti
                     WHEN cash_amount IS NOT NULL THEN 'pending'
                     ELSE 'review_required'
                 END
-            WHERE seme = %s AND status IN ('pending', 'review_required')
+            WHERE seme = %s AND isin = %s AND status IN ('pending', 'review_required')
             RETURNING id
-        """, (nominal, seme))
+        """, (nominal, seme, isin))
         row = cur.fetchone()
         if row:
             conn.commit()
@@ -4440,9 +4440,9 @@ def _upsert_enbd_ca_entitlement(conn, data: Dict[str, Any], received_at) -> Opti
             INSERT INTO back_office_auto.tab_mt566_parsed
                 (received_at, pdf_filename, seme, isin, action_type, nominal, gl_account_name, status)
             VALUES (%s, %s, %s, %s, %s, %s, 'NBD-CUSTODY-USD', 'review_required')
-            ON CONFLICT (seme) DO NOTHING
+            ON CONFLICT (seme, isin) DO NOTHING
             RETURNING id
-        """, (received_at, data.get("pdf_filename"), seme, data.get("isin"),
+        """, (received_at, data.get("pdf_filename"), seme, isin,
               data.get("action_type", "DIVIDEND"), nominal))
         row = cur.fetchone()
         conn.commit()
@@ -4467,8 +4467,6 @@ def _process_enbd_ca_message(
     is_entitlement = "ENTITLEMENT ADVICE" in subj_upper
 
     message_id = msg["id"]
-    attachments = get_message_attachments(token, mailbox, message_id)
-
     note = "ENBD CA Entitlement Advice received" if is_entitlement else "ENBD CA Payment Advice received"
     insert_settlement_email(
         conn=conn,
@@ -4480,10 +4478,12 @@ def _process_enbd_ca_message(
         status="RECEIVED",
         note=note,
         mailbox=mailbox,
-        attachment_count=len(attachments),
+        attachment_count=0,
         parsed_trade_count=0,
         processing_run_id=processing_run_id,
     )
+
+    attachments = get_message_attachments(token, mailbox, message_id)
 
     parsed_count = 0
     for att in attachments:
@@ -8174,14 +8174,20 @@ def run_email_parser_http(req: func.HttpRequest) -> func.HttpResponse:
                 if not is_sender_allowed(sender, allowed_senders) and not sender.endswith("@amwealth.ae"):
                     skipped += 1
                     continue
-                status, count = process_message(
-                    conn=conn,
-                    token=token,
-                    mailbox=mailbox,
-                    msg=msg,
-                    mapping_by_sender=mapping_by_sender,
-                    processing_run_id=run_id,
-                )
+                try:
+                    status, count = process_message(
+                        conn=conn,
+                        token=token,
+                        mailbox=mailbox,
+                        msg=msg,
+                        mapping_by_sender=mapping_by_sender,
+                        processing_run_id=run_id,
+                    )
+                except Exception as _msg_err:
+                    logging.exception("process_message failed for msg %s sender %s: %s",
+                                      msg.get("id"), sender, _msg_err)
+                    skipped += 1
+                    continue
                 if status in {"PARSED", "NO_TRADES_FOUND"}:
                     parsed_messages += 1
                 elif status in {"SKIPPED", "ALREADY_PROCESSED"}:
@@ -8239,14 +8245,20 @@ def daily_email_parser(timer: func.TimerRequest) -> None:
                 if not is_sender_allowed(sender, allowed_senders) and not sender.endswith("@amwealth.ae"):
                     skipped += 1
                     continue
-                status, count = process_message(
-                    conn=conn,
-                    token=token,
-                    mailbox=mailbox,
-                    msg=msg,
-                    mapping_by_sender=mapping_by_sender,
-                    processing_run_id=run_id,
-                )
+                try:
+                    status, count = process_message(
+                        conn=conn,
+                        token=token,
+                        mailbox=mailbox,
+                        msg=msg,
+                        mapping_by_sender=mapping_by_sender,
+                        processing_run_id=run_id,
+                    )
+                except Exception as _msg_err:
+                    logging.exception("process_message failed for msg %s sender %s: %s",
+                                      msg.get("id"), sender, _msg_err)
+                    skipped += 1
+                    continue
                 if status in {"PARSED", "NO_TRADES_FOUND"}:
                     parsed_messages += 1
                 elif status in {"SKIPPED", "ALREADY_PROCESSED"}:
