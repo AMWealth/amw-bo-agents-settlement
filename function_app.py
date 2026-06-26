@@ -695,7 +695,38 @@ def rx(pattern: str, text: str, flags: int = re.IGNORECASE | re.MULTILINE) -> Op
     return m.group(1).strip() if m else None
 
 
+def _correct_year_typo(d: Optional[date], email_received_at: Optional[datetime]) -> Optional[date]:
+    """If a parsed date is ~365 days off from the email date (year typo, e.g. '25-Jun-25'
+    in a 2026 email), replace the year with the email's year so it passes validation."""
+    if not d or not email_received_at:
+        return d
+    email_date = email_received_at.date()
+    delta = (d - email_date).days
+    if abs(delta) < 15:
+        return d  # already close, nothing to fix
+    # Try substituting email's year (and ±1 year around it)
+    for candidate_year in (email_date.year, email_date.year - 1, email_date.year + 1):
+        try:
+            corrected = d.replace(year=candidate_year)
+        except ValueError:
+            continue  # e.g. Feb 29 in non-leap year
+        if abs((corrected - email_date).days) <= 14:
+            logging.warning(
+                "DATE_YEAR_TYPO_CORRECTED: %s → %s (email_date=%s)",
+                d, corrected, email_date,
+            )
+            return corrected
+    return d
+
+
 def finalize_trade_validation(trade: Dict[str, Any], email_received_at: Optional[datetime]):
+    # Auto-correct year typos before validation (e.g. broker sends "25-Jun-25" in a 2026 email)
+    if email_received_at:
+        if trade.get("trade_date"):
+            trade["trade_date"] = _correct_year_typo(trade["trade_date"], email_received_at)
+        if trade.get("value_date"):
+            trade["value_date"] = _correct_year_typo(trade["value_date"], email_received_at)
+
     issues = []
 
     if not trade.get("isin"):
