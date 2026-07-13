@@ -4276,6 +4276,8 @@ def parse_enbd_payment_advice_pdf(file_bytes: bytes, filename: str) -> Optional[
     gross_amount = _parse_money("Gross Amount")
     net_amount = _parse_money("Net Amount")
     tax_amount = _parse_money("Tax Amount")
+    # "Charges/Fees Amount USD 141.44" — distinct from "Charges/Fees Rate"; 0 if absent
+    charges_amount = _parse_money("Charges/Fees Amount")
 
     payment_date = _parse_enbd_ca_date(_find(r"Payment Date\s+(\d{1,2}\s+\w+\s+\d{4})"))
     record_date = _parse_enbd_ca_date(_find(r"Record Date\s+(\d{1,2}\s+\w+\s+\d{4})"))
@@ -4304,8 +4306,8 @@ def parse_enbd_payment_advice_pdf(file_bytes: bytes, filename: str) -> Optional[
     comment = comment_map.get(action_type, "")
 
     logging.warning(
-        "ENBD_CA_PAYMENT_PARSED file=%s ref=%s type=%s isin=%s net=%s gross=%s tax=%s ccy=%s pay=%s rec=%s cash_rate=%s nominal=%s",
-        filename, ca_reference, action_type, isin, net_amount, gross_amount, tax_amount,
+        "ENBD_CA_PAYMENT_PARSED file=%s ref=%s type=%s isin=%s net=%s gross=%s tax=%s charges=%s ccy=%s pay=%s rec=%s cash_rate=%s nominal=%s",
+        filename, ca_reference, action_type, isin, net_amount, gross_amount, tax_amount, charges_amount,
         currency, payment_date, record_date, cash_rate_raw, nominal,
     )
 
@@ -4320,7 +4322,7 @@ def parse_enbd_payment_advice_pdf(file_bytes: bytes, filename: str) -> Optional[
         "payment_date": payment_date,
         "trade_date": record_date,
         "tax_amount": tax_amount,
-        "charges_amount": Decimal("0"),
+        "charges_amount": charges_amount if charges_amount is not None else Decimal("0"),
         "nominal": nominal,
         "cash_account_iban": cash_account,
         "account_number_key": None,
