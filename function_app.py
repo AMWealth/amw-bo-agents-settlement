@@ -4417,7 +4417,7 @@ def _upsert_enbd_ca_payment(conn, data: Dict[str, Any], received_at) -> Optional
                     WHEN COALESCE(back_office_auto.tab_mt566_parsed.nominal, EXCLUDED.nominal) IS NOT NULL THEN 'pending'
                     ELSE 'review_required'
                 END
-            WHERE back_office_auto.tab_mt566_parsed.status IN ('pending', 'review_required')
+            WHERE back_office_auto.tab_mt566_parsed.status IN ('pending', 'review_required', 'skipped')
             RETURNING id
         """, (
             received_at,
@@ -4536,8 +4536,13 @@ def _process_enbd_ca_message(
         else:
             result = parse_enbd_payment_advice_pdf(file_bytes, filename)
             if result and result.get("seme"):
-                _upsert_enbd_ca_payment(conn, result, received_at)
-                parsed_count += 1
+                if _upsert_enbd_ca_payment(conn, result, received_at):
+                    parsed_count += 1
+                else:
+                    logging.warning(
+                        "ENBD_CA_PAYMENT upsert wrote 0 rows (row status not in pending/review_required/skipped): seme=%s isin=%s",
+                        result.get("seme"), result.get("isin"),
+                    )
 
     status = "PARSED" if parsed_count > 0 else "NO_TRADES_FOUND"
     insert_settlement_email(
