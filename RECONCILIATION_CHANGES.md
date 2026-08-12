@@ -1,5 +1,17 @@
 # Settlement Reconciliation Enhancement - Summary of Changes
 
+## 2026-06 — Suppress premature "No Confo" breaks
+Internal deals are now hidden from the **B. Internal Deals — No Confo Received** list
+when it is too early for a missing confo to be a real break (relative to the report
+run date, Dubai time):
+- **FX legs** (3-letter currency symbol such as GBP/USD/AMD) with **value date = today** (T+0)
+- **Any instrument** with **value date = tomorrow** (not yet due)
+
+New helpers in `function_app.py`: `_norm_to_date`, `_is_currency_symbol`,
+`suppress_premature_no_confo`. The filter is applied while building
+`unmatched_internal` inside `run_settlement_reconciliation`, so suppressed rows are
+excluded from the HTML report, Excel export, counts, and the "send email" trigger.
+
 ## Overview
 Enhanced the settlement reconciliation system with sophisticated multi-stage matching logic and new database tracking columns.
 

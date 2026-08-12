@@ -6583,6 +6583,46 @@ def is_reconciliation_window_open(currency: str | None) -> bool:
         return now_dubai.hour >= T1_COMPARE_HOUR
 
 
+def _norm_to_date(v) -> Optional[date]:
+    """Normalize a date / datetime / 'YYYY-MM-DD' string to a date object."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str):
+        try:
+            return datetime.strptime(v.strip()[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+    return None
+
+
+def _is_currency_symbol(symbol) -> bool:
+    """An FX leg stores a 3-letter currency code (GBP, USD, AMD) in `symbol`,
+    whereas a real security carries a 12-char alphanumeric ISIN."""
+    s = (symbol or "").strip().upper()
+    return len(s) == 3 and s.isalpha()
+
+
+def suppress_premature_no_confo(td: Dict[str, Any], today: date) -> bool:
+    """Business rule: hide internal deals from the 'No Confo' list when it is
+    too early for a missing confo to be a real break, so they don't look like
+    exceptions. Relative to the report run date (Dubai today):
+      - FX legs (3-letter currency symbol) with value date == today (T+0)
+      - ANY instrument with value date == tomorrow (not yet due)
+    """
+    vd = _norm_to_date(td.get("settle_date_cash") or td.get("value_date_cash"))
+    if vd is None:
+        return False
+    if vd == today + timedelta(days=1):
+        return True
+    if vd == today and _is_currency_symbol(td.get("symbol")):
+        return True
+    return False
+
+
 # =============================================================================
 # RECONCILIATION FIELD MAPPING
 # =============================================================================
@@ -7768,6 +7808,7 @@ def run_settlement_reconciliation(
         key = (clean_text(st.get("isin")), st.get("trade_date"))
         all_confo_by_isin_date.setdefault(key, []).append(st)
 
+    today_dubai = datetime.now(DUBAI_TZ).date()
     unmatched_internal = []
     for td in strict_deals:
         if td["id"] in matched_internal_ids:
@@ -7776,6 +7817,10 @@ def run_settlement_reconciliation(
         side_key = clean_text(td.get("direction"))
         date_key = td.get("trade_date")
         if (isin_key, side_key, date_key) in all_confo_keys:
+            continue
+        # Suppress premature breaks: FX (currency symbol) settling today,
+        # and anything settling tomorrow — not real "No Confo" yet.
+        if suppress_premature_no_confo(td, today_dubai):
             continue
         row = dict(td)
         # Check if a confo exists for same ISIN+date but different side or mismatched fields
@@ -9566,27 +9611,29 @@ def _cmar_parse_attachment(fname: str, data: bytes) -> dict:
                     if any(v is not None for v in row)
                 ][:100]
 
-        elif fname_lower.endswith(".xlsx") and "statement_of_holdings" in fname_lower:
-            # StoneX Statement of Holdings — headers row 11, data from row 12, sheet RPSTHLD
-            wb2 = load_workbook(io.BytesIO(data), data_only=True)
-            ws2 = wb2["RPSTHLD"] if "RPSTHLD" in wb2.sheetnames else wb2.active
-            rows_out = []
-            for row in ws2.iter_rows(min_row=12, max_row=2000, values_only=True):
-                isin = str(row[1] or "").strip() if len(row) > 1 else ""
-                if not isin or isin.upper() == "SECURITY ISIN":
-                    continue
-                rows_out.append({
-                    "isin": isin,
-                    "name": str(row[2] or "") if len(row) > 2 else "",
-                    "market_code": str(row[3] or "") if len(row) > 3 else "",
-                    "security_type": str(row[4] or "") if len(row) > 4 else "",
-                    "qty": row[6] if len(row) > 6 else None,
-                    "price_date": str(row[7])[:10] if len(row) > 7 and row[7] else "",
-                    "exchange": "StoneX",
-                    "symbol": isin,
-                    "currency": "USD",
-                })
-            out["gtn_settled_holdings"].extend(rows_out)
+            elif "statement_of_holdings" in fname_lower:
+                # Statement of Holdings — headers row 11, data from row 12, sheet RPSTHLD.
+                # NOTE: was previously an unreachable outer `elif` (the generic
+                # xlsx branch above swallowed every .xlsx), so this file was
+                # silently skipped.
+                ws = wb["RPSTHLD"] if "RPSTHLD" in wb.sheetnames else wb.active
+                rows_out = []
+                for row in ws.iter_rows(min_row=12, max_row=2000, values_only=True):
+                    isin = str(row[1] or "").strip() if len(row) > 1 else ""
+                    if not isin or isin.upper() == "SECURITY ISIN":
+                        continue
+                    rows_out.append({
+                        "isin": isin,
+                        "name": str(row[2] or "") if len(row) > 2 else "",
+                        "market_code": str(row[3] or "") if len(row) > 3 else "",
+                        "security_type": str(row[4] or "") if len(row) > 4 else "",
+                        "qty": row[6] if len(row) > 6 else None,
+                        "price_date": str(row[7])[:10] if len(row) > 7 and row[7] else "",
+                        "exchange": "StoneX",
+                        "symbol": isin,
+                        "currency": "USD",
+                    })
+                out["gtn_settled_holdings"].extend(rows_out)
 
         # ── PDF — log only, no auto-parse yet ────────────────────────────────
         elif fname_lower.endswith(".pdf"):

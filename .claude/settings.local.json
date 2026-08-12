@@ -4,7 +4,11 @@
       "Bash(.venv/Scripts/python.exe -:*)",
       "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\(''function_app.py''\\).read\\(\\)\\); print\\(''OK - no syntax errors''\\)\")",
       "Bash(.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\(''function_app.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK - no syntax errors''\\)\")",
-      "Bash(python -m pytest tests/test_parsers.py -k \"cub\" -v)"
+      "Bash(python -m pytest tests/test_parsers.py -k \"cub\" -v)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''function_app.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''function_app.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -m py_compile function_app.py)",
+      "Bash(grep -rn \"trade.to.process\\\\|trades.to.process\\\\|trade_to_process\\\\|trades_to_process\\\\|to.process\\\\|toProcess\" 'c:/Users/KseniiaMalkova/OneDrive - amwealth/Documents/projects/amw-bo-agents-settlement/' --include=*.py --include=*.js --include=*.ts --include=*.html --include=*.json)"
     ]
   }
 }
