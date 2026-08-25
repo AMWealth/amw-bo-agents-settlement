@@ -232,7 +232,17 @@ def get_graph_token() -> str:
         "grant_type": "client_credentials",
     }
     r = requests.post(url, data=data, timeout=60)
-    r.raise_for_status()
+    if r.status_code != 200:
+        # raise_for_status() swallows the body, which is where Azure AD puts the
+        # AADSTS code (7000222 = expired client secret, 7000215 = wrong secret).
+        try:
+            body = r.json()
+            detail = f"{body.get('error')}: {body.get('error_description', '')[:300]}"
+        except Exception:
+            detail = r.text[:300]
+        raise RuntimeError(
+            f"Graph token request failed (HTTP {r.status_code}) for tenant {TENANT_ID}: {detail}"
+        )
     return r.json()["access_token"]
 
 
@@ -8188,9 +8198,17 @@ def run_reconciliation_http(req: func.HttpRequest) -> func.HttpResponse:
             f"comparison_rows={result['comparison_rows']}, matched={result['matched_count']}")
         has_data = (result.get("comparison_rows", 0) > 0
                     or len(result.get("unmatched_internal", [])) > 0)
+        # The reconciliation itself is already done and committed at this point.
+        # A failing email (e.g. expired Graph client secret) must not turn the
+        # whole call into a 500 and hide the result from the UI.
+        email_error = None
         if has_data:
-            token = get_graph_token()
-            send_reconciliation_email(token, result, confo_from, t0_date)
+            try:
+                token = get_graph_token()
+                send_reconciliation_email(token, result, confo_from, t0_date)
+            except Exception as email_err:
+                logging.exception("Failed to send reconciliation email: %s", email_err)
+                email_error = str(email_err)
         return func.HttpResponse(
             json.dumps({
                 "ok": True,
@@ -8199,6 +8217,7 @@ def run_reconciliation_http(req: func.HttpRequest) -> func.HttpResponse:
                 "matched_aggregated_count": result.get("matched_aggregated_count", 0),
                 "partial_count": result.get("partial_count", 0),
                 "run_id": run_id,
+                "email_error": email_error,
                 # Full data for web display (mirrors what is sent in the email)
                 "detail_rows": result.get("detail_rows", []),
                 "unmatched_internal": result.get("unmatched_internal", []),
