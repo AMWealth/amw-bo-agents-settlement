@@ -82,6 +82,9 @@ ALLOWED_SENDERS_FALLBACK = {
     "noreply@bankfab.com",
     # ENBD Securities Order Confirmation Reports (GCM / Sincy Joji)
     "sincyjo@emiratesnbd.com",
+    # Tradeweb trade confirmations (platform sends from the trader's own
+    # Tradeweb user email @eusers.tradeweb.com) — added 2026-09-01
+    "adouggui@eusers.tradeweb.com",
 }
 
 TEST_SENDERS_DEFAULT = [
@@ -106,6 +109,7 @@ TEST_SENDERS_DEFAULT = [
     "vijuraj.thandalath@bankfab.com",
     "validationstryops@emiratesnbd.com",
     "confirmationstryops@tanfeeth.ae",
+    "adouggui@eusers.tradeweb.com",
 ]
 
 # =============================================================================
@@ -767,6 +771,10 @@ SENDER_DOMAIN_FALLBACK: Dict[str, Dict[str, str]] = {
     "tanfeeth.ae": {"template_code": "ENBD_PDF", "broker_name": "Emirates NBD"},
     "bankfab.com": {"template_code": "FAB_SWIFT_PDF", "broker_name": "First Abu Dhabi Bank PJSC"},
     "camcapmarkets.com": {"template_code": "CAMCAP_PDF", "broker_name": "CAMcap Markets Ltd."},
+    # Tradeweb: confirmations come from the executing trader's own Tradeweb
+    # user address (<user>@eusers.tradeweb.com), so match the whole domain.
+    "eusers.tradeweb.com": {"template_code": "TRADEWEB_PDF", "broker_name": "Tradeweb"},
+    "tradeweb.com": {"template_code": "TRADEWEB_PDF", "broker_name": "Tradeweb"},
 }
 
 
@@ -1961,6 +1969,141 @@ def parse_camcap_pdf(
         file_id=file_id,
         email_id=email_id,
         side_original_text=direction_phrase,
+        trade_date_original_text=trade_date_raw,
+        value_date_original_text=value_date_raw,
+    )
+    trade = normalize_trade_signs(trade)
+    finalize_trade_validation(trade, email_received_at)
+
+    if not trade.get("isin") and not trade.get("security_name"):
+        return []
+    return [trade]
+
+
+def parse_tradeweb_pdf(
+    text: str,
+    internet_message_id: str,
+    source_file: str,
+    email_received_at: Optional[datetime],
+    processing_run_id: Optional[int],
+    file_id: Optional[int],
+    email_id: Optional[int],
+    broker_name: str,
+) -> List[Dict[str, Any]]:
+    """
+    Tradeweb "Trade summary" confirmation PDF — one trade per file.
+    Sent automatically by the Tradeweb platform from the executing trader's
+    own user address (<user>@eusers.tradeweb.com) to Back Office.
+
+    Text layout after pdfplumber (the two detail columns merge into one line):
+
+        Trade summary
+        Side Quantity Security Customer / TW user ID Company Trade date / time
+        BUY 70,000 ROMANI 6.375 30/01/34 Achraf Douggui AM Wealth 01/09/26 05:27:53 EDT
+        Trade detail
+        ISIN XS2756521303 Yield 6.461%
+        Quote type Price Settle date 03/09/26
+        Trade date 01/09/26 Benchmark yield 4.784%
+        TW trade ID 12154 Spread 167.7 (order varies)
+        Traded price USD $99.49 Trade Best Yes
+        Corp principal USD $69,643.00 / Corp accrued USD $409.06 / Corp total USD $70,052.06
+
+    Notes:
+      - Side is from AM Wealth's perspective (Customer/Company = AM Wealth):
+        BUY = we buy. No inversion needed.
+      - EUCR blast = European credit bonds: Quantity is the face amount → nominal;
+        Traded price is a bond percentage price → price_in_percentage.
+      - Dates are dd/mm/yy.
+      - counterparty_reference = TW trade ID.
+      - Default SSI "TRADE WEB EC 57159" is resolved later by enrich_cpty_ssi()
+        via counterparty_ssi_mapping (single active SSI for TRADE WEB).
+    """
+    # Summary row: side, quantity and everything after (case-sensitive on purpose)
+    summary_m = re.search(r"^(BUY|SELL)\s+([0-9][0-9,\.]*)\s+(.+)$", text, re.MULTILINE)
+    side_raw = summary_m.group(1) if summary_m else None
+    qty_raw = summary_m.group(2) if summary_m else None
+    security_name = None
+    if summary_m:
+        rest = summary_m.group(3).strip()
+        # Bond description ends with the maturity date, e.g. "ROMANI 6.375 30/01/34";
+        # the customer name / company / trade datetime follow it.
+        sec_m = re.match(r"(.+?\d{1,2}/\d{1,2}/\d{2,4})(?:\s|$)", rest)
+        if sec_m:
+            security_name = sec_m.group(1)
+        else:
+            security_name = rest.split(" AM Wealth")[0].strip() or rest
+
+    isin = rx(r"\bISIN\s+([A-Z]{2}[A-Z0-9]{9}[0-9])\b", text)
+    trade_date_raw = rx(r"Trade\s+date\s+(\d{1,2}/\d{1,2}/\d{2,4})", text)
+    value_date_raw = rx(r"Settle\s+date\s+(\d{1,2}/\d{1,2}/\d{2,4})", text)
+    tw_trade_id = rx(r"TW\s+trade\s+ID\s+([A-Za-z0-9\-]+)", text)
+
+    ccy = (
+        rx(r"Corp\s+principal\s+([A-Z]{3})\s", text)
+        or rx(r"Traded\s+price\s+([A-Z]{3})\s", text)
+        or "USD"
+    )
+    price_pct_raw = rx(r"Traded\s+price\s+[A-Z]{3}\s+\$?\s?([0-9][0-9,\.]*)", text)
+    principal_raw = rx(r"Corp\s+principal\s+[A-Z]{3}\s+\$?\s?([0-9][0-9,\.]*)", text)
+    accrued_raw = rx(r"Corp\s+accrued\s+[A-Z]{3}\s+\$?\s?([0-9][0-9,\.]*)", text)
+    total_raw = rx(r"Corp\s+total\s+[A-Z]{3}\s+\$?\s?([0-9][0-9,\.]*)", text)
+    yield_raw = rx(r"\bYield\s+([0-9\.]+)\s*%", text)
+    dealer_raw = rx(r"^Dealer\s+([A-Z0-9]{2,10})\s*$", text)
+
+    side = normalize_side(side_raw, "TRADEWEB_PDF")
+    trade_date = parse_date_any(trade_date_raw, prefer_day_first=True)
+    value_date = parse_date_any(value_date_raw, prefer_day_first=True)
+    nominal = parse_decimal(qty_raw)
+    price_pct = parse_decimal(price_pct_raw)
+    consideration = parse_decimal(principal_raw)
+    accrued = parse_decimal(accrued_raw)
+    net_amount = parse_decimal(total_raw) or consideration
+
+    ref = tw_trade_id or build_generic_reference(
+        isin, side, trade_date, value_date, None, price_pct, nominal
+    )
+
+    trade = build_trade_dict(
+        internet_message_id=internet_message_id,
+        source_file=source_file,
+        source_type="pdf",
+        broker_name=broker_name,
+        security_name=security_name,
+        isin=isin,
+        side=side,
+        trade_date=trade_date,
+        value_date=value_date,
+        quantity=None,
+        price=None,
+        price_currency=ccy,
+        consideration=consideration,
+        commission=None,
+        net_amount=net_amount,
+        settlement_terms="DVP",
+        counterparty_reference=ref,
+        nominal=nominal,
+        price_in_percentage=price_pct,
+        accrued_interest=accrued,
+        settlement_currency=ccy,
+        parser_template="TRADEWEB_PDF",
+        raw_json=json.dumps({
+            "side_raw": side_raw,
+            "qty_raw": qty_raw,
+            "trade_date_raw": trade_date_raw,
+            "value_date_raw": value_date_raw,
+            "price_pct_raw": price_pct_raw,
+            "principal_raw": principal_raw,
+            "accrued_raw": accrued_raw,
+            "total_raw": total_raw,
+            "ccy": ccy,
+            "yield_raw": yield_raw,
+            "dealer": dealer_raw,
+            "tw_trade_id": tw_trade_id,
+        }, default=str),
+        processing_run_id=processing_run_id,
+        file_id=file_id,
+        email_id=email_id,
+        side_original_text=side_raw,
         trade_date_original_text=trade_date_raw,
         value_date_original_text=value_date_raw,
     )
@@ -3624,6 +3767,9 @@ def parse_pdf_file(
     if template_code == "CAMCAP_PDF":
         return parse_camcap_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
+    if template_code == "TRADEWEB_PDF":
+        return parse_tradeweb_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
+
     if template_code == "ZARATTINI_PDF":
         return parse_zarattini_pdf(text, internet_message_id, filename, email_received_at, processing_run_id, file_id, email_id, broker_name)
 
@@ -5152,6 +5298,9 @@ def _extract_ssi_hints(text: str) -> List[Dict[str, str]]:
 # Used when broker_name in settlement_trades doesn't match tab_counterparty directly
 _BROKER_NAME_ALIASES: Dict[str, str] = {
     "instinet": "market securities",
+    # DB counterparty id=271: "Tradeweb Execution Services Limited" (TESL),
+    # SSI: TRADE WEB EC 57159
+    "tradeweb": "tradeweb execution",
 }
 
 # instr_type (from Instinet raw_json) → keyword present in ssi_name

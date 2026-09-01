@@ -1,5 +1,21 @@
 # Settlement Reconciliation Enhancement - Summary of Changes
 
+## 2026-09-01 — New counterparty: Tradeweb (TRADEWEB_PDF)
+Tradeweb now emails trade confirmations to Back Office directly from the platform,
+sent from the executing trader's own Tradeweb user address
+(e.g. adouggui@eusers.tradeweb.com), one PDF ("Trade summary") per trade.
+
+- `parse_tradeweb_pdf()` in `function_app.py`: parses Side/Quantity from the
+  summary row (already from AM Wealth's perspective), ISIN, Trade date,
+  Settle date (dd/mm/yy), Traded price (bond % price), Corp principal /
+  accrued / total, TW trade ID as counterparty reference.
+- Domain fallback `eusers.tradeweb.com` / `tradeweb.com` → TRADEWEB_PDF, so any
+  trader's Tradeweb address is accepted without a mapping-table row.
+- Default SSI **TRADE WEB EC 57159** resolved by `enrich_cpty_ssi()`;
+  run `migrate_add_tradeweb.py` once to link counterparty and SSI
+  (and to add the sender to `counterparty_email_mapping` for visibility).
+- Tests: `test_tradeweb_parse.py` (3 real samples of 2026-09-01 + SELL case).
+
 ## 2026-06 — Suppress premature "No Confo" breaks
 Internal deals are now hidden from the **B. Internal Deals — No Confo Received** list
 when it is too early for a missing confo to be a real break (relative to the report
