@@ -9598,7 +9598,8 @@ def _cmar_parse_attachment(fname: str, data: bytes) -> dict:
         "external_positions": [], "inventory_positions": [], "reconc_summary": [],
         "gtn_fund_holdings": [], "gtn_settled_holdings": [], "cash_balances": [],
         "cmf_orders": [], "repo_data": [], "stonex_balance": [],
-        "vision_bank": [], "portfolio_holdings": [], "bank_balances": [],
+        "vision_bank": [], "portfolio_holdings": [], "portfolio_holdings_prop": [],
+        "bank_balances": [],
     }
 
     try:
@@ -9773,11 +9774,20 @@ def _cmar_parse_attachment(fname: str, data: bytes) -> dict:
             elif "portfolio holdings" in fname_lower or "portfolio_holdings" in fname_lower:
                 ws = wb.active
                 headers = [str(c.value) if c.value else f"col{i}" for i, c in enumerate(next(ws.iter_rows(min_row=1, max_row=1)))]
-                out["portfolio_holdings"] = [
+                _ph_rows = [
                     dict(zip(headers, [str(v) if v is not None else "" for v in row]))
                     for row in ws.iter_rows(min_row=2, max_row=500, values_only=True)
                     if any(v is not None for v in row)
                 ][:100]
+                # PROP-portfolio export ('Portfolio Holdings Export - PROP
+                # ACCOUNT.xlsx') is byte-identical in FORMAT to the client-money
+                # export — only the filename and the accounts inside differ.
+                # Route it to its own bucket so the firm's PROP positions never
+                # contaminate the Client Money reconciliation.
+                if "prop" in fname_lower:
+                    out["portfolio_holdings_prop"] = _ph_rows
+                else:
+                    out["portfolio_holdings"] = _ph_rows
 
             elif "statement_of_holdings" in fname_lower:
                 # Statement of Holdings — headers row 11, data from row 12, sheet RPSTHLD.
@@ -9861,7 +9871,8 @@ def _cmar_merge_results(parts: List[dict]) -> dict:
         "external_positions": [], "inventory_positions": [], "reconc_summary": [],
         "gtn_fund_holdings": [], "gtn_settled_holdings": [], "cash_balances": [],
         "cmf_orders": [], "repo_data": [], "stonex_balance": [],
-        "vision_bank": [], "portfolio_holdings": [], "bank_balances": [],
+        "vision_bank": [], "portfolio_holdings": [], "portfolio_holdings_prop": [],
+        "bank_balances": [],
         "_enbd": {"client_money": None, "custody": None},
         "failed_trades": [],
     }
@@ -9869,7 +9880,8 @@ def _cmar_merge_results(parts: List[dict]) -> dict:
         for key in ("external_positions", "inventory_positions", "reconc_summary",
                     "gtn_fund_holdings", "gtn_settled_holdings", "cash_balances",
                     "cmf_orders", "repo_data", "stonex_balance",
-                    "vision_bank", "portfolio_holdings", "bank_balances"):
+                    "vision_bank", "portfolio_holdings", "portfolio_holdings_prop",
+                    "bank_balances"):
             merged[key].extend(p.get(key, []))
     return merged
 
@@ -10043,6 +10055,62 @@ def _cmar_save_to_db(conn, report_date: str, result: dict) -> str:
                  avg_price, market_price, market_value, currency)
                 VALUES %s
             """, holdings)
+
+        # PROP Portfolio Holdings (firm's own PROP portfolio — separate table,
+        # never mixed with the client-money portfolio_holdings bucket).
+        # Raw rows carry the FAB export headers verbatim; the indented name
+        # block sits in the unnamed columns col1..col4 before 'Currency'.
+        def _prop_num(v):
+            s = str(v or "").strip().replace(",", "")
+            if not s or s.upper() in ("N/A", "NA", "-"):
+                return None
+            try:
+                return float(s)
+            except ValueError:
+                return None
+
+        prop_rows = []
+        for r in result.get("portfolio_holdings_prop", []):
+            isin = str(r.get("ISIN", "") or "").strip()
+            asset_class = str(r.get("Asset Class", "") or "").strip()
+            if not isin and not asset_class:
+                continue  # subtotal row (Total / asset-class header)
+            name = ""
+            for k in ("Holdings By Asset Class", "col1", "col2", "col3", "col4"):
+                v = str(r.get(k, "") or "").strip()
+                if v:
+                    name = v
+                    break
+            prop_rows.append((
+                report_date,
+                str(r.get("Account Number", "") or "").strip(),
+                str(r.get("Account IBAN", "") or "").strip(),
+                name, asset_class,
+                str(r.get("Currency", "") or "").strip(),
+                isin or None,
+                _prop_num(r.get("Quantity / Balance")),
+                _prop_num(r.get("Market Value (USD)")),
+                "portfolio_holdings_prop",
+            ))
+        if prop_rows:
+            # Savepoint: a missing tab_cmar_prop_holdings (migration not yet run)
+            # must not fail the whole CMAR save — log and carry on instead.
+            cur.execute("SAVEPOINT sp_prop_holdings")
+            try:
+                cur.execute("DELETE FROM back_office_auto.tab_cmar_prop_holdings WHERE report_date = %s",
+                            (report_date,))
+                execute_values(cur, """
+                    INSERT INTO back_office_auto.tab_cmar_prop_holdings
+                    (report_date, account_number, account_iban, name, asset_class,
+                     currency, isin, quantity, market_value_usd, source_file)
+                    VALUES %s
+                """, prop_rows)
+                cur.execute("RELEASE SAVEPOINT sp_prop_holdings")
+            except Exception as ex:
+                cur.execute("ROLLBACK TO SAVEPOINT sp_prop_holdings")
+                logging.warning("CMAR_PARSER: PROP holdings not saved (%s) — "
+                                "run migrate_fab_prop.sql to create "
+                                "back_office_auto.tab_cmar_prop_holdings", ex)
 
         # Determine status
         has_mismatches = any(
