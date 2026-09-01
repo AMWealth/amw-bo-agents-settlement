@@ -65,11 +65,20 @@ try:
             print(f"= mapping row already exists for {SENDER} "
                   f"(template_code={existing.get('template_code')})")
         else:
+            # market, delivered_to_email_at_amwealth and parser_type are NOT NULL
+            # without a default — fill them like the neighbouring broker rows.
+            # sl_no is GENERATED ALWAYS AS IDENTITY, so it must be left out.
+            # Only template_code drives parsing; parser_type and
+            # expected_file_type are descriptive (function_app.py never reads them).
             desired = {
                 "email_address_of_counterparty": SENDER,
                 "counterparty": "Tradeweb Execution Services Limited",
                 "counterparty_alias": "Tradeweb",
+                "market": "Fixed Income",
+                "delivered_to_email_at_amwealth": "back.office@amwealth.ae",
                 "template_code": TEMPLATE,
+                "parser_type": "pdf_letter",
+                "expected_file_type": "pdf",
                 "is_active": True,
             }
             row = {k: v for k, v in desired.items() if k in cols}
