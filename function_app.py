@@ -6547,10 +6547,37 @@ def load_strict_deals_to_process(
         return [dict(r) for r in cur.fetchall()]
 
 
-def load_broad_trade_search(conn) -> List[Dict[str, Any]]:
+def load_broad_trade_search(
+    conn,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Fallback pool, used only after every strict match has failed.
+
+    Keeps FULLY SETTLED deals (status 4): a confo whose internal deal is already settled
+    must still be able to find it, which is what the broad re-score downstream is for.
+    Without them such a confo fell through to find_similar_broad_rows and pinned an
+    unrelated deal of the same ISIN within the similarity window as a near miss, which
+    then hid that deal from the trade-match screen (CA76134C1023, 2026-09-25).
+    FAILED (6) and CANCELLED (7) stay out — a confo must never match those.
+
+    Bounded by trade_date because the ssi_name subquery costs ~4ms/row and settled deals
+    go back to 2024: unbounded this query takes ~23s per run. Callers pass the deal window
+    already widened by SIMILAR_DATE_WINDOW_DAYS, which is as far as the consumers look.
+    """
+    extra = ""
+    params: list = []
+    if date_from is not None:
+        extra += " AND trades.trade_date >= %s"
+        params.append(date_from)
+    if date_to is not None:
+        extra += " AND trades.trade_date <= %s"
+        params.append(date_to)
+
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            """
+            f"""
             SELECT
                 trades.id,
                 trades.id AS back_id,
@@ -6590,12 +6617,14 @@ def load_broad_trade_search(conn) -> List[Dict[str, Any]]:
             LEFT JOIN back_office.tab_counterparty cp
                 ON trades.counterparty_id = cp.id
             WHERE trades.reason = 0
-              AND trades.status NOT IN (4, 6, 7)
+              AND trades.status NOT IN (6, 7)
               AND trades.login <> 1007
               AND trades.type_deal <> 2
               AND trades.settle_type = 'external'
+              {extra}
             ORDER BY trades.trade_date DESC, trades.time DESC
-            """
+            """,
+            params or None,
         )
         return [dict(r) for r in cur.fetchall()]
 
@@ -6932,10 +6961,15 @@ def try_aggregate_match(
     return None, None, None
 
 
+# How far from a confo's trade_date the broad fallback is allowed to look for the same ISIN.
+# load_broad_trade_search widens its own window by this much, so keep the two in step.
+SIMILAR_DATE_WINDOW_DAYS = 3
+
+
 def find_similar_broad_rows(st: Dict[str, Any], broad_deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     similar = []
     st_trade_date = st.get("trade_date")
-    date_window = 3
+    date_window = SIMILAR_DATE_WINDOW_DAYS
 
     for td in broad_deals:
         if clean_text(st.get("isin")) != clean_text(td.get("symbol")):
@@ -7669,7 +7703,15 @@ def run_settlement_reconciliation(
         date_from=deal_date_from if deal_date_from is not None else date_from,
         date_to=deal_date_to if deal_date_to is not None else date_to,
     )
-    broad_deals = load_broad_trade_search(conn)
+    # Widen the deal window by the similarity window: the broad fallback may reach that far
+    # from a confo's trade_date, and nothing downstream looks further.
+    _broad_from = deal_date_from if deal_date_from is not None else date_from
+    _broad_to = deal_date_to if deal_date_to is not None else date_to
+    broad_deals = load_broad_trade_search(
+        conn,
+        date_from=(_broad_from - timedelta(days=SIMILAR_DATE_WINDOW_DAYS)) if _broad_from else None,
+        date_to=(_broad_to + timedelta(days=SIMILAR_DATE_WINDOW_DAYS)) if _broad_to else None,
+    )
     unconfirmed_deals = load_unconfirmed_deals(
         conn,
         date_from=deal_date_from if deal_date_from is not None else date_from,
