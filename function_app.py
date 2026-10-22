@@ -7423,11 +7423,6 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
     style = """
     body { font-family: Calibri, Arial, sans-serif; font-size: 13px; color: #222; }
     h2 { color: #2F5496; margin-bottom: 4px; }
-    .summary { display: flex; gap: 12px; margin: 16px 0; }
-    .badge { padding: 12px 20px; border-radius: 6px; font-size: 15px; font-weight: bold; min-width: 120px; text-align: center; }
-    .green  { background: #C6EFCE; color: #276221; }
-    .yellow { background: #FFEB9C; color: #7D6608; }
-    .red    { background: #FFC7CE; color: #9C0006; }
     table { border-collapse: collapse; width: 100%; margin-bottom: 24px; font-size: 12px; }
     th { background: #2F5496; color: white; padding: 6px 8px; text-align: center; }
     td { padding: 5px 8px; border: 1px solid #D0D0D0; white-space: nowrap; }
@@ -7449,15 +7444,24 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
         return f"<td{cls}>{ext_s}</td><td{cls}>{int_s}</td>"
 
     # ── Summary badges ─────────────────────────────────────────────────────────
+    # One row of four boxes. Outlook ignores display:flex and stacked them one under
+    # the other, the last one full width (M.Gupta 22.10.2026) - so a table, styles inline.
+    def _summary_badges(*counts):
+        boxes = (("✅ Matched", "#C6EFCE", "#276221"), ("⚠️ Needs Review", "#FFEB9C", "#7D6608"),
+                 ("❌ No Confo", "#FFC7CE", "#9C0006"), ("🔔 Unconfirmed", "#DAEEF3", "#1F497D"))
+        cells = "".join(
+            f'<td width="140" align="center" bgcolor="{bg}" style="background:{bg}; color:{fg}; padding:12px 20px; '
+            f'border:none; border-radius:6px; font-size:15px; font-weight:bold; text-align:center; white-space:nowrap;">'
+            f'{label}<br><span style="font-size:22px">{n}</span></td>'
+            + ('<td width="12" style="border:none; padding:0;">&nbsp;</td>' if i < len(boxes) - 1 else '')
+            for i, ((label, bg, fg), n) in enumerate(zip(boxes, counts)))
+        return (f'<table role="presentation" cellpadding="0" cellspacing="0" border="0" '
+                f'style="border-collapse:separate; width:auto; margin:16px 0; font-size:15px;"><tr>{cells}</tr></table>')
+
     html = f"""<html><head><style>{style}</style></head><body>
 <h2>Settlement Reconciliation Report</h2>
 <div style="color:#555; margin-bottom:8px;">Trade dates: <b>{date_label}</b></div>
-<div class="summary">
-  <div class="badge green">✅ Matched<br><span style="font-size:22px">{matched}</span></div>
-  <div class="badge yellow">⚠️ Needs Review<br><span style="font-size:22px">{partial}</span></div>
-  <div class="badge red">❌ No Confo<br><span style="font-size:22px">{no_confo}</span></div>
-  <div class="badge" style="background:#DAEEF3; color:#1F497D;">🔔 Unconfirmed<br><span style="font-size:22px">{unconfirmed_count}</span></div>
-</div>
+{_summary_badges(matched, partial, no_confo, unconfirmed_count)}
 <div style="font-size:12px; color:#555; margin-bottom:16px;">
   Exact match: {sum(1 for r in _active_rows if r.get('status') == 'MATCHED')} &nbsp;|&nbsp;
   Netting: {sum(1 for r in _active_rows if r.get('status') == 'MATCHED_AGGREGATED')} &nbsp;|&nbsp;
