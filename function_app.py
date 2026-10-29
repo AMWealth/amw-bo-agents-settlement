@@ -7205,6 +7205,13 @@ def _fmt_date(v) -> str:
     return str(v)[:10]
 
 
+def _to_process(row: Dict[str, Any]) -> bool:
+    """A confo row still to work on: not every internal deal of it is instructed, settled or
+    cancelled in BO (rows flagged in run_settlement_reconciliation). E-mail, subject and Excel
+    show only these, as the trade-match page does."""
+    return not row.get("instructed") and not row.get("closed")
+
+
 def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
     """Build an Excel workbook with reconciliation results. Returns bytes."""
     STATUS_COLOR = {
@@ -7233,7 +7240,7 @@ def build_reconciliation_excel(result: dict, date_from, date_to) -> bytes:
 
     for row in result.get("detail_rows", []):
         status = row.get("status", "")
-        if status not in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING"):
+        if status not in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING") or not _to_process(row):
             continue
         color = STATUS_COLOR.get(status, "FFFFFF")
         data = [
@@ -7393,11 +7400,9 @@ def compute_gl_account(symbol: str) -> str:
 
 def build_reconciliation_html(result: dict, date_from, date_to) -> str:
     """Build HTML email body for reconciliation report."""
-    # Count only non-instructed rows for summary
-    _active_rows = [
-        r for r in result.get("detail_rows", [])
-        if not r.get("instructed")
-    ]
+    # Count only rows still to process (not instructed / settled / cancelled) for summary
+    _active_rows = [r for r in result.get("detail_rows", []) if _to_process(r)]
+    _closed_n = sum(1 for r in result.get("detail_rows", []) if r.get("closed"))
     matched = sum(1 for r in _active_rows if r.get("status") in ("MATCHED", "MATCHED_AGGREGATED"))
     partial = sum(1 for r in _active_rows if r.get("status") == "PARTIAL")
     no_confo = len(result.get("unmatched_internal", []))
@@ -7469,14 +7474,15 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
   Internal no confo: {no_confo} &nbsp;|&nbsp;
   Unconfirmed (FX): {unconfirmed_count}
 </div>
-"""
+""" + (f'<div style="font-size:11px; color:#888; margin-bottom:12px;">{_closed_n} confo(s) on deals already '
+       f'settled or cancelled in Back Office not shown.</div>\n' if _closed_n else "")
 
     # ── Table A: Confo vs Internal ─────────────────────────────────────────────
     _table_a_rows = [
         r for r in result.get("detail_rows", [])
         if r.get("status") in ("MATCHED", "PARTIAL", "MATCHED_AGGREGATED", "NETTING")
         and r.get("validation_status") != "FAILED"
-        and not r.get("instructed")
+        and _to_process(r)
     ]
     html += f"""<div class="sect">A. Confo vs Internal — {len(_table_a_rows)} trades to process</div>
 <table>
@@ -7626,8 +7632,8 @@ def build_reconciliation_html(result: dict, date_from, date_to) -> str:
 
 def send_reconciliation_email(token: str, result: dict, date_from, date_to) -> None:
     """Send reconciliation report email with Excel attachment via Graph API."""
-    # Count only non-instructed rows for subject line
-    _active = [r for r in result.get("detail_rows", []) if not r.get("instructed")]
+    # Count only rows still to process for the subject line (same rule as the body)
+    _active = [r for r in result.get("detail_rows", []) if _to_process(r)]
     matched = sum(1 for r in _active if r.get("status") in ("MATCHED", "MATCHED_AGGREGATED"))
     partial = sum(1 for r in _active if r.get("status") == "PARTIAL")
     no_confo = len(result.get("unmatched_internal", []))
@@ -8082,11 +8088,26 @@ def run_settlement_reconciliation(
             """, (run_id, run_id))
             instructed_deal_ids = {row[0] for row in _cur.fetchall() if row[0]}
 
+    # Deals already settled (4) or cancelled (7) in BO. A confo is re-found against its settled
+    # deal on purpose (b9623b6), but the e-mail listed every such row again: 29.10.2026 run 3939,
+    # 43 MATCHED + all 17 PARTIAL were on settled deals, 4 rows left to process - what the
+    # trade-match page shows (v_active_trades_to_process, deal_status NOT IN (4, 7)). M.Gupta 28.10.2026.
+    closed_deal_ids: set = set()
+    _all_ids = {int(x.strip()) for r in detail_rows for x in (r.get("int_ids") or "").split(",") if x.strip().isdigit()}
+    if _all_ids:
+        with conn.cursor() as _cur:
+            _cur.execute("SELECT id FROM back_office.tab_deals WHERE id = ANY(%s) AND status IN (4, 7)",
+                         (list(_all_ids),))
+            closed_deal_ids = {row[0] for row in _cur.fetchall()}
+
     for row in detail_rows:
         ids_str = row.get("int_ids") or ""
         row_ids = {int(x.strip()) for x in ids_str.split(",") if x.strip().isdigit()}
         if row_ids and row_ids.issubset(instructed_deal_ids):
             row["instructed"] = True
+        # nothing left to do: every deal of the row instructed, settled or cancelled
+        if row_ids and row_ids.issubset(instructed_deal_ids | closed_deal_ids) and not row.get("instructed"):
+            row["closed"] = True
 
     return {
         "comparison_rows": comparison_rows,
