@@ -6636,8 +6636,9 @@ def load_unconfirmed_deals(
 ) -> List[Dict[str, Any]]:
     """
     Loads deals that will never receive an automated confirmation email:
-      - FX trades (type_deal = 2)
-    These are shown in Table C as UNCONFIRMED for manual review.
+      - deposits (type_deal = 2, ~dUSD3M etc.) until their principal is settled
+    These are shown in Table C as UNCONFIRMED for manual review. FX goes as ordinary deals
+    (type_deal 0) and drops off once settled (status 4).
     Note: ENBD is now handled via ENBD_PDF parser and goes through normal reconciliation (Tables A/B).
     """
     extra = ""
@@ -6687,6 +6688,17 @@ def load_unconfirmed_deals(
               AND trades.status NOT IN (4, 6, 7)
               AND trades.login = 1
               AND trades.type_deal = 2
+              -- a deposit deal stays VERIFIED until maturity; once its opening leg is settled it
+              -- is done - same rule as trade-match Section C (29.10.2026: 37107 ~dUSD3M, principal
+              -- settled 22.10, still in the e-mail; M.Gupta)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM back_office.tab_connect_deal_transfer cdt
+                  JOIN back_office.tab_transfer t ON t.id = cdt.id_transfer
+                  WHERE cdt.id_deal = trades.id
+                    AND t.type = 'DEPOSIT_PRINCIPAL'
+                    AND t.status = 4
+              )
               {extra}
             ORDER BY trades.trade_date DESC, trades.id DESC
             """,
