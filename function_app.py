@@ -10376,6 +10376,106 @@ def _run_cmar_snapshot(conn) -> dict:
     return {'snapshot_date': str(today), 'inserted': inserted}
 
 
+# =============================================================================
+# W-8 RELIEF - QUANTITY CHECK (M.Gupta 04.11.2026)
+# FAB is told the W-8 client's quantity ~5 business days before the coupon; if the client sells
+# in between, FAB relieves a quantity he no longer holds. Every weekday 17:10 Dubai the BO app
+# (/api/w8/qty-alert, the Tax relief chain on /w8) compares the quantity e-mailed to FAB with the
+# client's FAB position on the coupon date; this sends the result - "nothing changed" or the list.
+# App Settings: W8_ALERT_KEY (same value as on backoffice-amwealth), BO_APP_URL, W8_ALERT_TO.
+# =============================================================================
+BO_APP_URL = os.environ.get("BO_APP_URL", "https://backoffice-amwealth-embzafgefeh5dyek.uaenorth-01.azurewebsites.net").strip().rstrip("/")
+
+
+def _dmy_iso(s) -> str:
+    try:
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+    except ValueError:
+        return str(s or "")
+
+
+def run_w8_qty_alert() -> Dict[str, Any]:
+    import html as _html
+    key = os.environ.get("W8_ALERT_KEY", "").strip()
+    if not key:
+        raise RuntimeError("W8_ALERT_KEY is not set")
+    r = requests.get(f"{BO_APP_URL}/api/w8/qty-alert", headers={"X-Alert-Key": key}, timeout=200)
+    if r.status_code != 200:
+        raise RuntimeError(f"BO /api/w8/qty-alert HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    rows = data.get("rows", [])
+    changed = [x for x in rows if x.get("holding") and not x["holding"].get("matches")]
+    unknown = [x for x in rows if not x.get("holding")]
+    day = _dmy_iso(data.get("date"))
+    subject = (f"W-8 relief - quantity check {day} | "
+               + (f"❌ {len(changed)} quantity changed - tell FAB" if changed
+                  else "✅ nothing sold" if rows else "no relief coupons pending"))
+    e = lambda v: _html.escape(str(v if v is not None else ""))
+    num = lambda v: f"{float(v):,.2f}" if v is not None else ""
+    td = 'style="border:1px solid #999;padding:3px 6px;font-size:10pt;font-family:Calibri,Arial,sans-serif"'
+    th = td[:-1] + ';background:#C5D9F1;font-weight:bold"'
+    trs = []
+    for x in sorted(rows, key=lambda x: (x.get("holding") or {}).get("matches", False)):
+        h = x.get("holding")
+        bad = bool(h) and not h.get("matches")
+        at = (f"{num(h['position'])} on {_dmy_iso(h['date'])}" if h else "could not check")
+        trades = ", ".join(f"{t['side']} {num(t['nominal'])} {_dmy_iso(t['trade_date'])}"
+                           for t in (h or {}).get("trades", []))
+        bg = ' style="background:#f8d7da"' if bad else ""
+        trs.append(f"<tr{bg}><td {td}>{e(x['login'])}</td><td {td}>{e((x.get('owner') or '').title())}</td>"
+                   f"<td {td}>{e(x['isin'])}</td><td {td}>{_dmy_iso(x['coupon_date'])}</td>"
+                   f"<td {td}>{_dmy_iso(x['sent']) if x.get('sent') else ('draft, not sent' if x.get('draft') else '')}</td>"
+                   f"<td {td} align=right>{num(x.get('quantity'))}</td><td {td} align=right>{e(at)}</td>"
+                   f"<td {td}>{e(trades or '-')}</td><td {td}>{'<b>QUANTITY CHANGED</b>' if bad else 'OK'}</td></tr>")
+    p = '<p style="font-family:Calibri,Arial,sans-serif;font-size:11pt">'
+    if changed:
+        intro = (f"{p}<b>{len(changed)} coupon(s): the client's FAB position on the coupon date is not the quantity "
+                 f"in the Tax Relief e-mail to FAB.</b> Tell FAB the right quantity (or cancel the relief).</p>")
+    elif rows:
+        intro = f"{p}Nothing sold: every quantity e-mailed to FAB is still held at FAB on the coupon date.</p>"
+    else:
+        intro = f"{p}No Tax Relief e-mails to FAB with a coupon still to come.</p>"
+    if unknown:
+        intro += f"{p}{len(unknown)} line(s) could not be checked - see the W-8 page.</p>"
+    table = ("" if not rows else
+             '<table style="border-collapse:collapse"><tr>'
+             + "".join(f"<td {th}>{h}</td>" for h in ("Login", "Beneficial owner", "ISIN", "Coupon date",
+                                                     "E-mail to FAB", "Quantity e-mailed", "At FAB",
+                                                     "Trades since the e-mail", "Check"))
+             + "</tr>" + "".join(trs) + "</table>")
+    body = (f"{intro}{table}{p}Details: <a href=\"{BO_APP_URL}/w8\">{BO_APP_URL}/w8</a> "
+            f"(Tax relief chain).</p>")
+    to = [a.strip() for a in os.environ.get("W8_ALERT_TO", "Back.office@amwealth.ae").split(";") if a.strip()]
+    payload = {"message": {"subject": subject, "body": {"contentType": "HTML", "content": body},
+                           "toRecipients": [{"emailAddress": {"address": a}}
+                                            for a in ([TEST_EMAIL] if TEST_MODE else to)]},
+               "saveToSentItems": False}
+    s = requests.post(f"{GRAPH_BASE}/users/{GRAPH_MAILBOX}/sendMail", json=payload,
+                      headers={"Authorization": f"Bearer {get_graph_token()}"}, timeout=60)
+    s.raise_for_status()
+    return {"rows": len(rows), "changed": len(changed), "unknown": len(unknown), "subject": subject}
+
+
+@app.function_name(name="w8_qty_alert")
+@app.timer_trigger(schedule="0 10 13 * * 1-5", arg_name="timer", run_on_startup=False, use_monitor=False)
+def w8_qty_alert(timer: func.TimerRequest) -> None:
+    try:
+        logging.warning("W8_QTY_ALERT done: %s", run_w8_qty_alert())
+    except Exception as ex:
+        logging.exception("w8_qty_alert failed: %s", ex)
+
+
+@app.function_name(name="run_w8_qty_alert")
+@app.route(route="run-w8-qty-alert", auth_level=func.AuthLevel.FUNCTION, methods=["POST"])
+def run_w8_qty_alert_http(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        return func.HttpResponse(json.dumps({"ok": True, **run_w8_qty_alert()}),
+                                 mimetype="application/json", status_code=200)
+    except Exception as ex:
+        logging.exception("run_w8_qty_alert_http failed: %s", ex)
+        return func.HttpResponse(json.dumps({"error": str(ex)}), mimetype="application/json", status_code=500)
+
+
 @app.function_name(name="cmar_trades_snapshot")
 @app.timer_trigger(schedule="0 0 11 * * 1-5", arg_name="timer", run_on_startup=False, use_monitor=False)
 def cmar_trades_snapshot(timer: func.TimerRequest) -> None:
