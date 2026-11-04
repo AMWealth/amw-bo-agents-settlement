@@ -10378,13 +10378,23 @@ def _run_cmar_snapshot(conn) -> dict:
 
 # =============================================================================
 # W-8 RELIEF - QUANTITY CHECK (M.Gupta 04.11.2026)
-# FAB is told the W-8 client's quantity ~5 business days before the coupon; if the client sells
-# in between, FAB relieves a quantity he no longer holds. Every weekday 17:10 Dubai the BO app
-# (/api/w8/qty-alert, the Tax relief chain on /w8) compares the quantity e-mailed to FAB with the
-# client's FAB position on the coupon date; this sends the result - "nothing changed" or the list.
-# App Settings: W8_ALERT_KEY (same value as on backoffice-amwealth), BO_APP_URL, W8_ALERT_TO.
+# FAB is told the W-8 client's quantity ~5 business days before the coupon ("Tax Relief at source
+# to be availed ISIN ... QUANTITY ..."); if the client sells in between, FAB relieves a quantity he
+# no longer holds. Every weekday 17:10 Dubai this compares, for each relief e-mail whose coupon is
+# still to come, the quantity e-mailed with the client's FAB position on the coupon date (as the
+# Tax relief chain on BO /w8 does) and sends the result - "nothing sold" or the list.
+# Reads the DB and the Back Office mailbox itself, like the CMAR snapshot: the BO app is behind
+# its IP restrictions and the agents cannot call it.
+# App Settings (optional): W8_ALERT_TO (default Back.office@amwealth.ae), W8_RELIEF_MAILBOX.
 # =============================================================================
+W8_RELIEF_MAILBOX = os.environ.get("W8_RELIEF_MAILBOX", _mailbox2 or GRAPH_MAILBOX).strip()
 BO_APP_URL = os.environ.get("BO_APP_URL", "https://backoffice-amwealth-embzafgefeh5dyek.uaenorth-01.azurewebsites.net").strip().rstrip("/")
+W8_FAB_PORTFOLIO = "1000015880"                  # FAB-EC-CLIENTS, the omnibus the relief is asked for
+_W8_SUBJ = re.compile(r"tax\s+relief\s+at\s+source\s+to\s+be\s+availed\s+isin\s+([A-Z]{2}[A-Z0-9]{9}\d)"
+                      r"(?:\s+quantity\s*[-–]?\s*([\d,]+(?:\.\d+)?))?", re.I)
+_W8_OWNER = re.compile(r"for\s+client\s+(.+?)\s+tax\s+relief", re.I)
+_W8_CDATE = re.compile(r"next_coupon_date(.*)", re.I | re.S)
+_W8_DMY = re.compile(r"\b(\d{1,2})-([A-Za-z]{3})-(\d{2,4})\b")
 
 
 def _dmy_iso(s) -> str:
@@ -10394,15 +10404,136 @@ def _dmy_iso(s) -> str:
         return str(s or "")
 
 
+def _w8_name(s) -> str:
+    return " ".join(sorted(re.findall(r"[a-z]+", (s or "").lower())))
+
+
+def _w8_text(html_s: str) -> str:
+    """The e-mail's own text (not the quoted chain), one line per cell / paragraph (as BO w8_forms)."""
+    import html as _html
+    s = re.sub(r"(?is)<(script|style).*?</\1>", " ", html_s or "")
+    s = re.sub(r"[ \t]*\r?\n[ \t]*", " ", s)
+    s = re.sub(r"(?i)<br\s*/?>|</(div|p|li|tr|td|th)>", "\n", s)
+    s = _html.unescape(re.sub(r"<[^>]+>", " ", s)).replace("\xa0", " ")
+    s = "\n".join(re.sub(r"[ \t]+", " ", ln).strip() for ln in s.splitlines() if ln.strip())
+    m = re.search(r"(?im)^\s*(from:\s|-{3,}\s*original message|_{5,})", s)
+    return s[:m.start()] if m else s
+
+
+def _w8_relief_mails(token: str, since: date) -> List[Dict[str, Any]]:
+    """The sent "Tax Relief at source" e-mails to FAB (not drafts, not replies, not FAB's own)."""
+    h = {"Authorization": f"Bearer {token}", "Prefer": 'outlook.body-content-type="html"'}
+    url = f"{GRAPH_BASE}/users/{W8_RELIEF_MAILBOX}/messages"
+    params = {"$search": '"Tax Relief at source"', "$top": "50",
+              "$select": "id,subject,from,isDraft,sentDateTime,uniqueBody,body"}
+    out, pages = [], 0
+    while url and pages < 6:
+        r = requests.get(url, headers=h, params=params, timeout=60)
+        r.raise_for_status()
+        j = r.json()
+        for m in j.get("value", []):
+            subj = m.get("subject") or ""
+            x = _W8_SUBJ.search(subj)
+            sent = (m.get("sentDateTime") or "")[:10]
+            frm = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+            if (not x or m.get("isDraft") or not sent or sent < since.isoformat()
+                    or re.match(r"\s*(re|aw|fw|fwd)\s*:", subj, re.I) or frm.endswith("bankfab.com")):
+                continue
+            own = _w8_text((m.get("uniqueBody") or {}).get("content") or (m.get("body") or {}).get("content"))
+            owner = _W8_OWNER.search(own)
+            cd = None
+            t = _W8_CDATE.search(own)
+            d = _W8_DMY.search(t.group(1)) if t else None
+            if d:
+                try:
+                    cd = datetime.strptime(f"{d.group(1)}-{d.group(2).title()}-{int(d.group(3)) % 100:02d}",
+                                           "%d-%b-%y").date()
+                except ValueError:
+                    cd = None
+            out.append({"isin": x.group(1).upper(), "qty": float(x.group(2).replace(",", "")) if x.group(2) else None,
+                        "owner": owner.group(1).strip() if owner else None, "coupon_date": cd, "sent": sent})
+        pages += 1
+        url, params = j.get("@odata.nextLink"), None
+    return out
+
+
+def _w8_fab_holding(cur, login, isin, cd, since) -> Optional[Dict[str, Any]]:
+    """The client's FAB position on the coupon date (positions are built forward, so known before it;
+    a client who sold out has no row = 0) and his buys / sells in the ISIN since the e-mail."""
+    try:
+        cur.execute("""SELECT least(%s::date, max(date_position)::date) AS d FROM back_office.tab_position_client
+                       WHERE symbol = %s""", (cd, isin))
+        on = cur.fetchone()["d"] or cd
+        cur.execute("""SELECT sum(p.nominal) AS nominal
+                       FROM back_office.tab_position_client p
+                       JOIN back_office.tab_gl_account g ON g.id = p.gl_account_id AND g.account_number = %s
+                       WHERE p.login = %s AND p.symbol = %s AND p.date_position::date = %s""",
+                    (W8_FAB_PORTFOLIO, login, isin, on))
+        p = cur.fetchone()
+        cur.execute("""SELECT action, nominal, trade_date FROM back_office.tab_deals
+                       WHERE login = %s AND symbol = %s AND action IN (0, 1) AND type_deal = 0
+                         AND canceled_date IS NULL AND trade_date BETWEEN %s AND %s
+                       ORDER BY trade_date""", (login, isin, since, cd))
+        trades = [{"side": "sell" if int(t["action"]) == 1 else "buy", "nominal": float(t["nominal"] or 0),
+                   "trade_date": t["trade_date"].isoformat()} for t in cur.fetchall()]
+    except Exception as ex:
+        logging.warning("w8 qty, FAB holding %s %s: %s", login, isin, ex)
+        cur.connection.rollback()
+        return None
+    return {"position": float((p or {}).get("nominal") or 0), "date": on.isoformat(), "trades": trades}
+
+
+def w8_qty_rows(conn, token: str, today: Optional[date] = None) -> Dict[str, Any]:
+    """Every relief e-mail (BO's recorded drafts + the sent e-mails) whose coupon is still to come."""
+    today = today or date.today()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT client_login, client_name, beneficial_owner FROM back_office_auto.client_w8 WHERE active")
+    by_name, owners = {}, {}
+    for r in cur.fetchall():
+        lg = int(r["client_login"])
+        owners.setdefault(lg, r["beneficial_owner"] or r["client_name"] or "")
+        for n in (r["beneficial_owner"], r["client_name"]):
+            if n:
+                by_name.setdefault(_w8_name(n), lg)
+    items = {}
+    cur.execute("""SELECT client_login, isin, coupon_date, quantity, created_at FROM back_office_auto.client_w8_relief
+                   WHERE coupon_date >= %s""", (today,))
+    for r in cur.fetchall():
+        items[(int(r["client_login"]), r["isin"], r["coupon_date"])] = {
+            "quantity": float(r["quantity"]), "draft": r["created_at"].date().isoformat(), "sent": None}
+    for m in _w8_relief_mails(token, today - timedelta(days=60)):
+        login = by_name.get(_w8_name(m["owner"])) if m["owner"] else None
+        k = next((k for k in items if k[1] == m["isin"] and (login is None or k[0] == login)
+                  and (m["coupon_date"] is None or k[2] == m["coupon_date"])
+                  and (m["qty"] is None or abs(items[k]["quantity"] - m["qty"]) < 0.01)), None)
+        if k is None:
+            if not (login and m["coupon_date"]) or m["coupon_date"] < today:
+                continue
+            k = (login, m["isin"], m["coupon_date"])
+            items[k] = {"quantity": m["qty"], "draft": None, "sent": None}
+        if not items[k]["sent"] or m["sent"] > items[k]["sent"]:
+            items[k]["sent"] = m["sent"]
+    rows = []
+    for (login, isin, cd), it in sorted(items.items(), key=lambda kv: (kv[0][2], kv[0][0])):
+        mailed = it["sent"] or it["draft"]
+        hold = None
+        if it["quantity"] is not None:
+            hold = _w8_fab_holding(cur, login, isin, cd,
+                                   date.fromisoformat(mailed) if mailed else cd - timedelta(days=14))
+            if hold:
+                hold["matches"] = abs(hold["position"] - it["quantity"]) < 0.01
+        rows.append({"login": login, "owner": owners.get(login, ""), "isin": isin, "coupon_date": cd.isoformat(),
+                     "quantity": it["quantity"], "holding": hold, "sent": it["sent"], "draft": bool(it["draft"])})
+    return {"date": today.isoformat(), "rows": rows}
+
+
 def run_w8_qty_alert() -> Dict[str, Any]:
     import html as _html
-    key = os.environ.get("W8_ALERT_KEY", "").strip()
-    if not key:
-        raise RuntimeError("W8_ALERT_KEY is not set")
-    r = requests.get(f"{BO_APP_URL}/api/w8/qty-alert", headers={"X-Alert-Key": key}, timeout=200)
-    if r.status_code != 200:
-        raise RuntimeError(f"BO /api/w8/qty-alert HTTP {r.status_code}: {r.text[:300]}")
-    data = r.json()
+    conn = get_conn()
+    try:
+        data = w8_qty_rows(conn, get_graph_token())
+    finally:
+        conn.close()
     rows = data.get("rows", [])
     changed = [x for x in rows if x.get("holding") and not x["holding"].get("matches")]
     unknown = [x for x in rows if not x.get("holding")]
