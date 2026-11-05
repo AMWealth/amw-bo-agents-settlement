@@ -261,26 +261,55 @@ def normalize_email_address(sender_obj: Dict[str, Any]) -> str:
         return ""
 
 
+# Outlook rules move some bank mail out of the Inbox (ENBD corporate actions go
+# to "ENBD-MT566"); those folders are read too. Comma-separated display names,
+# looked up under the Inbox and at the top level; a folder a mailbox lacks is skipped.
+GRAPH_EXTRA_FOLDERS = [f.strip() for f in os.environ.get("GRAPH_EXTRA_FOLDERS", "ENBD-MT566").split(",") if f.strip()]
+
+
+def _find_mail_folder_id(token: str, mailbox: str, name: str) -> Optional[str]:
+    safe = name.replace("'", "''")
+    for base in (f"{GRAPH_BASE}/users/{mailbox}/mailFolders/Inbox/childFolders",
+                 f"{GRAPH_BASE}/users/{mailbox}/mailFolders"):
+        try:
+            r = requests.get(f"{base}?$filter=displayName eq '{safe}'&$select=id",
+                             headers=graph_headers(token), timeout=60)
+            r.raise_for_status()
+            found = r.json().get("value", [])
+            if found:
+                return found[0]["id"]
+        except Exception as e:
+            logging.warning("MAIL_FOLDER lookup %s/%s failed: %s", mailbox, name, e)
+    return None
+
+
 def list_recent_messages(token: str, mailbox: str, since_dt: datetime) -> List[Dict[str, Any]]:
     since_iso = since_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     filter_str = f"receivedDateTime ge {since_iso}"
-
-    url = (
-        f"{GRAPH_BASE}/users/{mailbox}/mailFolders/Inbox/messages"
+    query = (
         f"?$top=100"
         f"&$select=id,internetMessageId,subject,receivedDateTime,from,hasAttachments,bodyPreview"
         f"&$orderby=receivedDateTime desc"
         f"&$filter={filter_str}"
     )
 
-    results: List[Dict[str, Any]] = []
-    while url:
-        r = requests.get(url, headers=graph_headers(token), timeout=120)
-        r.raise_for_status()
-        data = r.json()
-        results.extend(data.get("value", []))
-        url = data.get("@odata.nextLink")
+    folders = ["Inbox"]
+    for name in GRAPH_EXTRA_FOLDERS:
+        fid = _find_mail_folder_id(token, mailbox, name)
+        if fid:
+            folders.append(fid)
 
+    results: List[Dict[str, Any]] = []
+    for folder in folders:
+        url = f"{GRAPH_BASE}/users/{mailbox}/mailFolders/{folder}/messages{query}"
+        while url:
+            r = requests.get(url, headers=graph_headers(token), timeout=120)
+            r.raise_for_status()
+            data = r.json()
+            results.extend(data.get("value", []))
+            url = data.get("@odata.nextLink")
+
+    results.sort(key=lambda m: m.get("receivedDateTime") or "", reverse=True)
     return results
 
 
