@@ -4246,23 +4246,53 @@ def parse_enbd_settlement_pdf(file_bytes: bytes, filename: str, email_id: int, r
     }
 
 
-def _match_enbd_instruction(conn, client_reference: Optional[str], isin: str, settlement_date) -> Tuple[Optional[int], str, str]:
-    """Return (instruction_id, match_status, match_note). Match by ISIN + value_date.
-    client_reference (PDF 'Our Reference No') uses a different format from id_amwl so
-    is stored for display only and not used for matching.
+def _match_enbd_instruction(conn, client_reference: Optional[str], isin: str, settlement_date,
+                            transaction_type: Optional[str] = None,
+                            quantity: Optional[float] = None) -> Tuple[Optional[int], str, str]:
+    """Return (instruction_id, match_status, match_note).
+
+    1. 'Our Reference No' equal to the instruction's id_amwl (AMWL_8007) on the same ISIN.
+       Older / hand-typed references (AMWEALTH200502, AMWL_0911) are not id_amwl - step 2.
+    2. ISIN + value_date + side: RVP / RFP receive = BUY, DVP / DFP deliver = SELL (all 270
+       confirmations with an exact reference follow this). Same quantity first, then not yet
+       settled, then the latest.
+    ISIN + date alone took the latest instruction of the day: a BUY and a SELL of the same
+    ISIN on one day both went to the SELL - RVP AMWL_8007 702 US78462F1030 was matched to
+    SELL 8008, its Settle settled the SELL again and BUY 8007 / deal 38016 stayed open
+    (S.Vincent 11.11.2026; earlier 121, 160, 239 the same way).
     """
     if not settlement_date:
         return (None, "NOT_FOUND", f"No settlement_date to match isin={isin}")
+    tt = (transaction_type or "").strip().upper()
+    side = "BUY" if tt.startswith("R") else "SELL" if tt.startswith("D") else None
     with conn.cursor() as cur:
+        if client_reference:
+            cur.execute("""
+                SELECT id FROM back_office.tab_instructions
+                WHERE id_amwl = %s AND isin = %s
+                  AND status NOT IN (7, 14, 21)
+                ORDER BY id DESC LIMIT 1
+            """, (client_reference.strip(), isin))
+            row = cur.fetchone()
+            if row:
+                return (row[0], "MATCHED", f"Matched by reference ref={client_reference}")
         cur.execute("""
             SELECT id FROM back_office.tab_instructions
             WHERE isin = %s AND value_date = %s
-            ORDER BY id DESC LIMIT 1
-        """, (isin, settlement_date))
+              AND (%s::text IS NULL OR instruction_type = %s::text)
+              AND status NOT IN (7, 14, 21)      -- CANCELLED / REJECTED / MAN_CANCELLED
+            ORDER BY (quantity = %s::numeric) DESC NULLS LAST,
+                     (status <> 4) DESC,
+                     id DESC
+            LIMIT 1
+        """, (isin, settlement_date, side, side, quantity))
         row = cur.fetchone()
         if row:
-            return (row[0], "MATCHED", f"Matched by ISIN+date ref={client_reference}")
-    return (None, "NOT_FOUND", f"No instruction found for isin={isin} date={settlement_date}")
+            return (row[0], "MATCHED",
+                    f"Matched by ISIN+date{'+' + side if side else ''} ref={client_reference}")
+    return (None, "NOT_FOUND",
+            f"No {side + ' ' if side else ''}instruction found for isin={isin} date={settlement_date}"
+            f" ({transaction_type or 'no type'}, ref={client_reference})")
 
 
 def _upsert_enbd_settlement_result(conn, result: Dict[str, Any]) -> int:
@@ -4354,6 +4384,8 @@ def _process_enbd_emcap_message(
                 result.get("client_reference"),
                 result["isin"],
                 result.get("settlement_date"),
+                result.get("transaction_type"),
+                result.get("quantity"),
             )
             result["match_status"] = match_status
             result["match_note"] = match_note
