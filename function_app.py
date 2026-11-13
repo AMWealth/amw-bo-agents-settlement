@@ -250,6 +250,30 @@ def get_graph_token() -> str:
     return r.json()["access_token"]
 
 
+def graph_get(url: str, headers: Dict[str, str], timeout: int = 120, params=None, tries: int = 4):
+    """GET from Microsoft Graph, retried on 429 and 5xx: a single 502 Bad Gateway from Graph
+    failed the whole run with HTTP 500 (Monica Gupta, 13.11.2026). Waits Retry-After when given,
+    else 2, 5, 10 s; the last response is returned as it is, for raise_for_status()."""
+    import time
+    for attempt in range(tries):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == tries - 1:
+                raise
+            time.sleep((2, 5, 10)[min(attempt, 2)])
+            continue
+        if r.status_code != 429 and r.status_code < 500 or attempt == tries - 1:
+            return r
+        try:
+            wait = min(int(r.headers.get("Retry-After", "")), 30)
+        except ValueError:
+            wait = (2, 5, 10)[min(attempt, 2)]
+        logging.warning("Graph %s on %s, retry %d in %ss", r.status_code, url.split("?")[0], attempt + 1, wait)
+        time.sleep(wait)
+    return r
+
+
 def graph_headers(token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
@@ -272,7 +296,7 @@ def _find_mail_folder_id(token: str, mailbox: str, name: str) -> Optional[str]:
     for base in (f"{GRAPH_BASE}/users/{mailbox}/mailFolders/Inbox/childFolders",
                  f"{GRAPH_BASE}/users/{mailbox}/mailFolders"):
         try:
-            r = requests.get(f"{base}?$filter=displayName eq '{safe}'&$select=id",
+            r = graph_get(f"{base}?$filter=displayName eq '{safe}'&$select=id",
                              headers=graph_headers(token), timeout=60)
             r.raise_for_status()
             found = r.json().get("value", [])
@@ -303,7 +327,7 @@ def list_recent_messages(token: str, mailbox: str, since_dt: datetime) -> List[D
     for folder in folders:
         url = f"{GRAPH_BASE}/users/{mailbox}/mailFolders/{folder}/messages{query}"
         while url:
-            r = requests.get(url, headers=graph_headers(token), timeout=120)
+            r = graph_get(url, headers=graph_headers(token), timeout=120)
             r.raise_for_status()
             data = r.json()
             results.extend(data.get("value", []))
@@ -334,7 +358,7 @@ def list_recent_messages_by_sender_python_filter(
 
 def get_message_attachments(token: str, mailbox: str, message_id: str) -> List[Dict[str, Any]]:
     url = f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/attachments?$top=100"
-    r = requests.get(url, headers=graph_headers(token), timeout=120)
+    r = graph_get(url, headers=graph_headers(token), timeout=120)
     r.raise_for_status()
     attachments = r.json().get("value", [])
 
@@ -352,7 +376,7 @@ def get_message_attachments(token: str, mailbox: str, message_id: str) -> List[D
     if only_smime:
         try:
             raw_url = f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/$value"
-            raw_r = requests.get(raw_url, headers=graph_headers(token), timeout=120)
+            raw_r = graph_get(raw_url, headers=graph_headers(token), timeout=120)
             raw_r.raise_for_status()
             import email as _email_mod
             msg = _email_mod.message_from_bytes(raw_r.content)
@@ -392,7 +416,7 @@ def get_message_full(token: str, mailbox: str, message_id: str) -> Dict[str, Any
         f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}"
         f"?$select=id,internetMessageId,subject,receivedDateTime,from,hasAttachments,body,bodyPreview"
     )
-    r = requests.get(url, headers=graph_headers(token), timeout=120)
+    r = graph_get(url, headers=graph_headers(token), timeout=120)
     r.raise_for_status()
     return r.json()
 
@@ -404,7 +428,7 @@ def get_attachment_content_bytes(
     attachment_id: str,
 ) -> bytes:
     url = f"{GRAPH_BASE}/users/{mailbox}/messages/{message_id}/attachments/{attachment_id}"
-    r = requests.get(url, headers=graph_headers(token), timeout=120)
+    r = graph_get(url, headers=graph_headers(token), timeout=120)
     r.raise_for_status()
     data = r.json()
 
@@ -8398,7 +8422,7 @@ def reparse_recent_http(req: func.HttpRequest) -> func.HttpResponse:
                     f"{GRAPH_BASE}/users/{GRAPH_MAILBOX}/messages/{message_id}"
                     f"?$select=id,internetMessageId,subject,receivedDateTime,from,hasAttachments"
                 )
-                r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+                r = graph_get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
                 r.raise_for_status()
                 msg_stub = r.json()
             except Exception as ex:
@@ -10501,7 +10525,7 @@ def _w8_relief_mails(token: str, since: date) -> List[Dict[str, Any]]:
               "$select": "id,subject,from,isDraft,sentDateTime,uniqueBody,body"}
     out, pages = [], 0
     while url and pages < 6:
-        r = requests.get(url, headers=h, params=params, timeout=60)
+        r = graph_get(url, headers=h, params=params, timeout=60)
         r.raise_for_status()
         j = r.json()
         for m in j.get("value", []):
